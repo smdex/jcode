@@ -1,7 +1,64 @@
-//! Spawning external clipboard helpers (`wl-copy`, `xclip`, `xsel`).
+//! Clipboard copy routing for the TUI.
 //!
-//! Kept out of `helpers.rs` so the clipboard-ownership contract has one home
-//! and its tests live next to it.
+//! Contract: whenever stdout is a terminal, the terminal itself is asked to
+//! set the clipboard via the OSC 52 escape sequence first, even when a host
+//! desktop display (`DISPLAY` / `WAYLAND_DISPLAY`) is also reachable and even
+//! over SSH. External helpers (`wl-copy`, `xclip`, `xsel`, `arboard`, native
+//! platform clipboards) are the non-terminal fallback. Everything lives here
+//! so the routing contract has one home and its tests sit next to it.
+
+/// Base64-encode UTF-8 text into a plain OSC 52 clipboard write.
+/// tmux and zellij recognize this sequence natively. Do not DCS-wrap it:
+/// tmux drops passthrough by default, even when native clipboard forwarding
+/// is enabled. Terminals and multiplexers must allow OSC 52 clipboard writes.
+pub(crate) fn build_osc52_sequence(text: &str) -> String {
+    use base64::Engine as _;
+    let payload = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    format!("\x1b]52;c;{payload}\x07")
+}
+
+/// Send the copy to the viewing terminal, not the machine hosting the TUI.
+/// A successful write is not an acknowledgement from the terminal: OSC 52
+/// can be disabled by terminal security settings or multiplexer configuration.
+#[cfg_attr(test, allow(dead_code))]
+pub(crate) fn copy_to_clipboard_osc52(text: &str) -> bool {
+    use std::io::{IsTerminal, Write};
+    let stdout = std::io::stdout();
+    if !stdout.is_terminal() {
+        return false;
+    }
+    let sequence = build_osc52_sequence(text);
+    let mut out = stdout.lock();
+    out.write_all(sequence.as_bytes()).is_ok() && out.flush().is_ok()
+}
+
+/// One leg of the clipboard copy chain.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ClipboardStrategy {
+    /// Ask the terminal itself to set the clipboard (OSC 52). This is where
+    /// the copy lands when stdout is a terminal, even if host desktop
+    /// clipboard tools are also installed (`DISPLAY` / `WAYLAND_DISPLAY` set)
+    /// and even over SSH.
+    TerminalOsc52,
+    /// Host-desktop clipboards: external helpers (`wl-copy`, `xclip`, `xsel`)
+    /// and native platform clipboard APIs.
+    HostDesktop,
+}
+
+/// Ordered copy strategies for `copy_to_clipboard`.
+///
+/// Terminal-first: with a TTY on stdout, OSC 52 runs before any host-desktop
+/// tool so the copy lands in the user's actual terminal session (e.g. an SSH
+/// or mux session where a local `DISPLAY` would target the wrong desktop).
+/// Without a TTY (pipes, `jcode run` non-interactive modes) OSC 52 is skipped
+/// entirely and the host-desktop leg is the fallback.
+pub(crate) fn clipboard_route(stdout_is_terminal: bool) -> &'static [ClipboardStrategy] {
+    if stdout_is_terminal {
+        &[ClipboardStrategy::TerminalOsc52]
+    } else {
+        &[ClipboardStrategy::HostDesktop]
+    }
+}
 
 /// Pipe `text` into an external clipboard helper (`wl-copy`, `xclip`, `xsel`)
 /// and report whether it took ownership of the selection.
@@ -193,8 +250,9 @@ mod ordering_tests {
     }
 
     /// With no working helper the chain must report failure, so the real
-    /// `copy_to_clipboard` continues to arboard and then OSC 52 rather than
-    /// showing a false "Copied" toast.
+    /// `copy_to_clipboard` reports failure for the desktop fallback leg
+    /// (after OSC 52 already had its turn, or when stdout is not a terminal)
+    /// rather than showing a false "Copied" toast.
     #[test]
     fn no_working_helper_reports_failure_so_later_fallbacks_run() {
         let _lock = crate::storage::lock_test_env();
@@ -204,5 +262,51 @@ mod ordering_tests {
             ("xsel", "exit 1"),
         ]);
         assert_eq!(first_helper_that_wins(), None);
+    }
+}
+
+/// Regression tests for terminal-first routing and safe OSC 52 encoding.
+#[cfg(test)]
+mod osc52_tests {
+    use super::{ClipboardStrategy, build_osc52_sequence, clipboard_route};
+    use base64::Engine as _;
+
+    #[test]
+    fn terminal_first_ordering_puts_osc52_before_host_desktop() {
+        // Routing depends only on the viewing terminal, not on DISPLAY,
+        // WAYLAND_DISPLAY, SSH_CONNECTION, or multiplexer environment variables.
+        assert_eq!(clipboard_route(true), &[ClipboardStrategy::TerminalOsc52]);
+        assert_eq!(clipboard_route(false), &[ClipboardStrategy::HostDesktop]);
+    }
+
+    #[test]
+    fn osc52_sequence_encodes_payload_as_standard_base64() {
+        assert_eq!(
+            build_osc52_sequence("hello clipboard"),
+            "\x1b]52;c;aGVsbG8gY2xpcGJvYXJk\x07"
+        );
+    }
+
+    #[test]
+    fn osc52_sequence_round_trips_utf8_and_control_characters() {
+        for text in ["", "héllo 世界 🧬", "line1\nline2\t\x1b]52;c;malicious\x07"] {
+            let sequence = build_osc52_sequence(text);
+            let payload = sequence
+                .strip_prefix("\x1b]52;c;")
+                .unwrap()
+                .strip_suffix('\x07')
+                .unwrap();
+            assert_eq!(
+                base64::engine::general_purpose::STANDARD
+                    .decode(payload)
+                    .unwrap(),
+                text.as_bytes()
+            );
+            assert!(!payload.contains('\x1b'));
+            assert!(!payload.contains('\x07'));
+            // Plain OSC52 uses native tmux/zellij clipboard forwarding,
+            // not DCS passthrough, which is commonly disabled.
+            assert!(!sequence.contains("\x1bPtmux;"));
+        }
     }
 }
