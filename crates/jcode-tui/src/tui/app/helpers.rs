@@ -378,11 +378,15 @@ pub(crate) fn stop_capturing_clipboard_for_tests() {
     }
 }
 
-/// Copy text to clipboard. On Windows and macOS, the native clipboard API
-/// (arboard) is authoritative, with OSC 52 as a remote-session fallback.
-/// Elsewhere, try wl-copy (Wayland), then xclip/xsel (X11, which keep owning
-/// the selection unlike arboard), then arboard, then OSC 52 as the
-/// remote-session fallback (SSH / Docker / tmux).
+/// Copy text to clipboard. Terminal-first: whenever stdout is a terminal, the
+/// copy goes to the terminal itself via OSC 52, even when host desktop
+/// clipboard tools are installed and a display is reachable (`DISPLAY` /
+/// `WAYLAND_DISPLAY`), and over SSH. That keeps the copy in the session the
+/// user is actually looking at (SSH/mux sessions where a local helper would
+/// target the wrong desktop). When stdout is not a terminal, the host-desktop
+/// chain runs instead: on Windows and macOS the native clipboard API (arboard)
+/// is authoritative; elsewhere wl-copy (Wayland), xclip/xsel (X11, which keep
+/// owning the selection unlike arboard), then arboard.
 pub(super) fn copy_to_clipboard(text: &str) -> bool {
     // Under test, never touch the OS clipboard. Beyond making results identical
     // on a desktop and a headless runner, the Linux path below spawns `wl-copy`,
@@ -409,115 +413,106 @@ pub(super) fn copy_to_clipboard(text: &str) -> bool {
 
     #[cfg(not(test))]
     {
-        // On Windows, the native clipboard API must run before OSC 52. Writing an
-        // OSC 52 sequence to stdout "succeeds" even when the console (conhost,
-        // older Windows Terminal) silently ignores it, which reported "Copied"
-        // while leaving the clipboard empty (issue #497). arboard talks to the
-        // Win32 clipboard directly and is authoritative there.
-        #[cfg(windows)]
-        {
-            if arboard::Clipboard::new()
-                .and_then(|mut cb| cb.set_text(text.to_string()))
-                .is_ok()
-            {
-                return true;
-            }
-            return copy_to_clipboard_osc52(text);
-        }
+        use std::io::IsTerminal;
 
-        // Same class of bug on macOS: Apple Terminal (Terminal.app) silently
-        // ignores OSC 52, yet writing the sequence to stdout "succeeds", so we
-        // reported "Copied" while leaving the clipboard untouched. NSPasteboard
-        // via arboard (with pbcopy as a belt-and-braces fallback) is authoritative
-        // for local sessions; OSC 52 remains as the final remote-session fallback.
-        #[cfg(target_os = "macos")]
-        {
-            if arboard::Clipboard::new()
-                .and_then(|mut cb| cb.set_text(text.to_string()))
-                .is_ok()
-            {
-                return true;
-            }
-            if let Ok(mut child) = std::process::Command::new("pbcopy")
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .spawn()
-            {
-                use std::io::Write;
-                if let Some(stdin) = child.stdin.as_mut()
-                    && stdin.write_all(text.as_bytes()).is_ok()
-                {
-                    drop(child.stdin.take());
-                    if child.wait().map(|s| s.success()).unwrap_or(false) {
+        // Terminal-first routing (see `clipboard_helper::clipboard_route`):
+        // with a TTY on stdout, OSC 52 runs instead of host-desktop tools.
+        // Writing the sequence "succeeds" even when the terminal ignores it,
+        // which is accepted here: a silent OSC 52 miss under a mux that has
+        // forwarding disabled (tmux without `set -g set-clipboard on`) or a
+        // terminal without OSC 52 support trades a lost copy for routing the
+        // copy at the terminal the user is actually using, and requesting
+        // terminal routing was deliberate. An I/O failure must not silently
+        // overwrite the server's desktop clipboard. Without a TTY, skip straight
+        // to the host-desktop fallback.
+        let route = clipboard_helper::clipboard_route(std::io::stdout().is_terminal());
+        for strategy in route {
+            match strategy {
+                clipboard_helper::ClipboardStrategy::TerminalOsc52 => {
+                    if clipboard_helper::copy_to_clipboard_osc52(text) {
+                        return true;
+                    }
+                }
+                clipboard_helper::ClipboardStrategy::HostDesktop => {
+                    if copy_to_clipboard_host_desktop(text) {
                         return true;
                     }
                 }
             }
-            copy_to_clipboard_osc52(text)
         }
-
-        // Linux has the same failure class (issue #504, Kali/X11): wl-copy fails
-        // outside Wayland, and many terminals (xterm, older VTE) silently ignore
-        // OSC 52 while the stdout write still "succeeds", so the arboard fallback
-        // never ran. Prefer native clipboards when a display is available:
-        // wl-copy (Wayland), then xclip/xsel (X11, which keep owning the
-        // selection), then arboard, and only then OSC 52 for genuinely
-        // headless/remote sessions (SSH, Docker, tmux) where the native paths
-        // fail fast for lack of a display server.
-        #[cfg(not(any(windows, target_os = "macos")))]
-        {
-            if clipboard_helper::copy_via_clipboard_helper("wl-copy", &[], text) {
-                return true;
-            }
-            // X11: prefer xclip/xsel over arboard. arboard's X11 backend sets the
-            // selection on a connection it owns and then closes it when the
-            // `Clipboard` is dropped, so the selection owner disappears and the
-            // clipboard silently reverts (issue #684) even though `set_text`
-            // returned Ok. xclip and xsel fork a background process that keeps
-            // owning the selection until a paste, which is what users expect.
-            if clipboard_helper::copy_via_clipboard_helper(
-                "xclip",
-                &["-selection", "clipboard"],
-                text,
-            ) {
-                return true;
-            }
-            if clipboard_helper::copy_via_clipboard_helper(
-                "xsel",
-                &["--clipboard", "--input"],
-                text,
-            ) {
-                return true;
-            }
-            if arboard::Clipboard::new()
-                .and_then(|mut cb| cb.set_text(text.to_string()))
-                .is_ok()
-            {
-                return true;
-            }
-            copy_to_clipboard_osc52(text)
-        }
+        false
     }
 }
 
-/// Copy to clipboard using the OSC 52 terminal escape sequence. This asks the
-/// terminal emulator to set the system clipboard without needing a local
-/// display server, making it work over SSH, inside Docker, and under tmux
-/// (with `set -g set-clipboard on`). Returns false if stdout is not a TTY.
-#[cfg_attr(test, allow(dead_code))]
-fn copy_to_clipboard_osc52(text: &str) -> bool {
-    use base64::Engine as _;
-    use std::io::{IsTerminal, Write};
-
-    let mut out = std::io::stdout();
-    if !out.is_terminal() {
-        return false;
+/// Host-desktop clipboard leg (no OSC 52). On Windows, the native clipboard
+/// API must be used rather than an escape sequence: consoles (conhost, older
+/// Windows Terminal) may silently ignore terminal sequences, which used to
+/// report "Copied" while leaving the clipboard empty (issue #497). arboard
+/// talks to the Win32 clipboard directly and is authoritative there.
+#[cfg(not(test))]
+fn copy_to_clipboard_host_desktop(text: &str) -> bool {
+    // Same class of bug on macOS: Apple Terminal (Terminal.app) silently
+    // ignores terminal clipboard sequences, yet writing to stdout "succeeds".
+    // NSPasteboard via arboard (with pbcopy as a belt-and-braces fallback) is
+    // authoritative for local sessions.
+    #[cfg(any(windows, target_os = "macos"))]
+    {
+        if arboard::Clipboard::new()
+            .and_then(|mut cb| cb.set_text(text.to_string()))
+            .is_ok()
+        {
+            return true;
+        }
     }
-    let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
-    // OSC 52: ESC ] 52 ; c ; <base64> BEL
-    let seq = format!("\x1b]52;c;{}\x07", encoded);
-    out.write_all(seq.as_bytes()).is_ok() && out.flush().is_ok()
+
+    #[cfg(target_os = "macos")]
+    if let Ok(mut child) = std::process::Command::new("pbcopy")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        use std::io::Write;
+        if let Some(stdin) = child.stdin.as_mut()
+            && stdin.write_all(text.as_bytes()).is_ok()
+        {
+            drop(child.stdin.take());
+            if child.wait().map(|s| s.success()).unwrap_or(false) {
+                return true;
+            }
+        }
+    }
+
+    // Linux has the same failure class (issue #504, Kali/X11): wl-copy fails
+    // outside Wayland. Prefer native clipboards when this leg runs (stdout is
+    // not a terminal, so OSC 52 already declined): wl-copy (Wayland), then
+    // xclip/xsel (X11, which keep owning the selection), then arboard.
+    // arboard's X11 backend sets the selection on a connection it owns and
+    // then closes it when the `Clipboard` is dropped, so the selection owner
+    // disappears and the clipboard silently reverts (issue #684) even though
+    // `set_text` returned Ok. xclip and xsel fork a background process that
+    // keeps owning the selection until a paste, which is what users expect.
+    #[cfg(not(any(windows, target_os = "macos")))]
+    {
+        if clipboard_helper::copy_via_clipboard_helper("wl-copy", &[], text) {
+            return true;
+        }
+        if clipboard_helper::copy_via_clipboard_helper("xclip", &["-selection", "clipboard"], text)
+        {
+            return true;
+        }
+        if clipboard_helper::copy_via_clipboard_helper("xsel", &["--clipboard", "--input"], text) {
+            return true;
+        }
+        if arboard::Clipboard::new()
+            .and_then(|mut cb| cb.set_text(text.to_string()))
+            .is_ok()
+        {
+            return true;
+        }
+    }
+
+    false
 }
 
 pub(crate) fn effort_display_label(effort: &str) -> &str {
