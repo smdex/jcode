@@ -179,6 +179,10 @@ impl App {
             ));
 
             let mut stream = loop {
+                if self.service_prompt_editor(terminal) {
+                    status_spinner_renderer.invalidate();
+                    status_spinner_renderer.draw_full(self, terminal)?;
+                }
                 tokio::select! {
                     biased;
                     // Handle keyboard input while waiting for API
@@ -340,6 +344,10 @@ impl App {
 
             // Stream with input handling
             loop {
+                if self.service_prompt_editor(terminal) {
+                    status_spinner_renderer.invalidate();
+                    status_spinner_renderer.draw_full(self, terminal)?;
+                }
                 let desired_redraw = crate::tui::redraw_interval(self);
                 if desired_redraw != redraw_period {
                     redraw_period = desired_redraw;
@@ -1450,6 +1458,10 @@ impl App {
                 self.batch_progress = None; // Clear previous batch progress
 
                 let result = loop {
+                    if self.service_prompt_editor(terminal) {
+                        status_spinner_renderer.invalidate();
+                        status_spinner_renderer.draw_full(self, terminal)?;
+                    }
                     tokio::select! {
                         biased;
                         // Handle keyboard input while tool executes

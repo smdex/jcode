@@ -3178,7 +3178,7 @@ pub(super) fn handle_swarm_prompt_command(app: &mut App, trimmed: &str) -> bool 
 /// Interactive editors need the primary screen and cooked input. Spawning one
 /// while the TUI keeps ownership of the terminal causes arrow-key escape
 /// sequences and editor output to be consumed/rendered by both processes.
-fn run_interactive_editor(
+pub(super) fn run_interactive_editor(
     command: &mut std::process::Command,
 ) -> std::io::Result<std::process::ExitStatus> {
     run_interactive_editor_with(
