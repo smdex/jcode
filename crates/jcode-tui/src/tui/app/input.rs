@@ -2229,6 +2229,10 @@ pub(super) fn handle_navigation_shortcuts(
         return true;
     }
 
+    if app.request_prompt_editor_for_key(code, modifiers) {
+        return true;
+    }
+
     if app.scroll_keys.is_bookmark(code, modifiers) {
         app.toggle_scroll_bookmark();
         return true;
