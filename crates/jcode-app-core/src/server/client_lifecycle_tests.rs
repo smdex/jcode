@@ -1228,6 +1228,95 @@ fn accepted_reload_recovery_continuation_marks_intent_delivered() -> anyhow::Res
     Ok(())
 }
 
+#[tokio::test]
+async fn message_with_late_installed_skill_reaches_completion() {
+    let _lock = crate::storage::lock_test_env();
+    let _env = IsolatedReloadRecoveryEnv::new();
+    let provider: Arc<dyn Provider> = Arc::new(CompleteImmediatelyProvider);
+    let registry = Registry::new(Arc::clone(&provider)).await;
+    let session_id = "session_late_skill_acceptance";
+    let session = crate::session::Session::create_with_id(session_id.into(), None, None);
+    let agent = Arc::new(Mutex::new(Agent::new_with_session(
+        provider, registry, session, None,
+    )));
+    let skill_name = "late-server-message-skill";
+    assert!(
+        !agent
+            .lock()
+            .await
+            .available_skill_names()
+            .contains(&skill_name.to_string())
+    );
+    let skill_dir = crate::storage::jcode_dir()
+        .unwrap()
+        .join("skills")
+        .join(skill_name);
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(skill_dir.join("SKILL.md"), format!(
+        "---\nname: {skill_name}\ndescription: Late server skill\n---\n\nUse server-owned instructions."
+    )).unwrap();
+
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let (done_tx, mut done_rx) = mpsc::unbounded_channel();
+    let mut processing = false;
+    let mut message_id = None;
+    let mut processing_session = None;
+    let mut task = None;
+    let members = Arc::new(RwLock::new(HashMap::new()));
+    let swarms = Arc::new(RwLock::new(HashMap::new()));
+    let history = Arc::new(RwLock::new(std::collections::VecDeque::new()));
+    let counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let (swarm_tx, _) = broadcast::channel(8);
+    start_processing_message(
+        ProcessingMessage {
+            id: 91,
+            content: "use the newly installed skill".into(),
+            images: Vec::new(),
+            system_reminder: None,
+            active_skill: Some(skill_name.into()),
+        },
+        session_id,
+        &mut ProcessingState {
+            client_is_processing: &mut processing,
+            message_id: &mut message_id,
+            session_id: &mut processing_session,
+            task: &mut task,
+        },
+        &agent,
+        &event_tx,
+        &done_tx,
+        Vec::new(),
+        &SwarmStatusRefs {
+            members: &members,
+            swarms_by_id: &swarms,
+            event_history: &history,
+            event_counter: &counter,
+            event_tx: &swarm_tx,
+        },
+    )
+    .await;
+    assert!(
+        processing,
+        "late installation must be accepted instead of emitting the not-installed error"
+    );
+    let (id, result, _) = tokio::time::timeout(Duration::from_secs(5), done_rx.recv())
+        .await
+        .expect("turn must finish")
+        .expect("completion event");
+    assert_eq!(id, 91);
+    result.expect("accepted message must complete successfully");
+    task.unwrap().await.unwrap();
+    let mut saw_done = false;
+    while let Ok(event) = event_rx.try_recv() {
+        assert!(
+            !matches!(event, ServerEvent::Error { .. }),
+            "unexpected error: {event:?}"
+        );
+        saw_done |= matches!(event, ServerEvent::Done { id: 91 });
+    }
+    assert!(saw_done, "client must receive successful completion");
+}
+
 #[test]
 fn reload_starting_rejects_new_turns_for_multiple_sessions() {
     let _guard = crate::storage::lock_test_env();
