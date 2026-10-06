@@ -402,6 +402,9 @@ pub(super) async fn handle_terminal_event(
     // lag. Mirrors the identical drain in `local::handle_terminal_event`.
     const MAX_DRAINED_EVENTS_PER_WAKE: usize = 32;
     for _ in 0..MAX_DRAINED_EVENTS_PER_WAKE {
+        if app.pending_prompt_editor {
+            break;
+        }
         if let Ok(Some(event)) = crate::tui::terminal_events::try_read() {
             needs_redraw |= apply_terminal_event(app, terminal, remote, Some(Ok(event))).await?;
         } else {

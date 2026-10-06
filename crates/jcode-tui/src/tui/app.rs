@@ -89,6 +89,7 @@ mod onboarding_repair;
 mod onboarding_sim;
 mod productivity;
 mod prompt_history;
+mod prompt_editor;
 mod remote;
 mod remote_header_hint;
 mod remote_notifications;
@@ -1558,6 +1559,8 @@ pub struct App {
     // Undo history for in-progress input editing (Ctrl+Z)
     input_undo_stack: Vec<(String, usize)>,
     input_typing_undo: Option<(Instant, usize)>,
+    // Serviced by the loop owner, never inside a key handler or burst drain.
+    pending_prompt_editor: bool,
     // Draft replaced by an explicit jump into prompt history (Ctrl+Up),
     // restored when Down walks back past the newest entry
     history_draft: Option<(String, usize)>,
