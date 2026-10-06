@@ -538,6 +538,10 @@ pub(super) fn draw_help_overlay(frame: &mut Frame, area: Rect, scroll: usize, ap
         "Ctrl+C / Ctrl+D",
         "Quit (press twice to confirm)",
     ));
+    lines.push(key_entry(
+        "Ctrl+G",
+        "Edit prompt in $VISUAL/$EDITOR (at chat bottom, no bookmark)",
+    ));
     lines.push(key_entry("Ctrl+X", "Cut entire input line to clipboard"));
     lines.push(key_entry(
         "Ctrl+A",
