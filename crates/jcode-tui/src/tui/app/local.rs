@@ -151,6 +151,9 @@ pub(super) fn handle_terminal_event(
     let mut needs_redraw = apply_terminal_event(app, terminal, event)?;
     const MAX_DRAINED_EVENTS_PER_WAKE: usize = 32;
     for _ in 0..MAX_DRAINED_EVENTS_PER_WAKE {
+        if app.pending_prompt_editor {
+            break;
+        }
         if let Ok(Some(event)) = crate::tui::terminal_events::try_read() {
             needs_redraw |= apply_terminal_event(app, terminal, Some(Ok(event)))?;
         } else {
