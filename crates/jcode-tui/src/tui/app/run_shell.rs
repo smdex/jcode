@@ -672,6 +672,10 @@ impl App {
         }
 
         loop {
+            if self.service_prompt_editor(&mut terminal) {
+                status_spinner_renderer.invalidate();
+                needs_redraw = true;
+            }
             self.sync_sleep_guard();
             let desired_redraw = crate::tui::redraw_interval(&self);
             if desired_redraw != redraw_period {
@@ -891,6 +895,10 @@ impl App {
 
             // Main event loop
             loop {
+                if self.service_prompt_editor(&mut terminal) {
+                    status_spinner_renderer.invalidate();
+                    needs_redraw = true;
+                }
                 self.sync_sleep_guard();
                 let desired_redraw = crate::tui::redraw_interval(&self);
                 if desired_redraw != redraw_period {
