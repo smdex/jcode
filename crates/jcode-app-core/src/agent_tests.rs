@@ -30,6 +30,55 @@ struct DelayedProvider {
 
 struct NativeAutoCompactionProvider;
 
+#[tokio::test]
+async fn remote_active_skill_refreshes_late_global_installation() {
+    let _guard = crate::storage::lock_test_env();
+    struct RestoreHome(Option<std::ffi::OsString>);
+    impl Drop for RestoreHome {
+        fn drop(&mut self) {
+            if let Some(home) = &self.0 {
+                crate::env::set_var("JCODE_HOME", home);
+            } else {
+                crate::env::remove_var("JCODE_HOME");
+            }
+            crate::config::Config::invalidate_cache();
+        }
+    }
+    let home = tempfile::tempdir().unwrap();
+    let _restore = RestoreHome(std::env::var_os("JCODE_HOME"));
+    crate::env::set_var("JCODE_HOME", home.path());
+    crate::config::Config::invalidate_cache();
+    let mut agent = Agent::new(Arc::new(NativeAutoCompactionProvider), Registry::empty());
+    let name = "late-global-activation-regression";
+    assert!(agent.current_skills_snapshot().get(name).is_none());
+    let dir = home.path().join("skills").join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("SKILL.md"),
+        format!("---\nname: {name}\ndescription: Late installation\n---\n\nServer-owned prompt."),
+    )
+    .unwrap();
+
+    assert!(agent.set_remote_active_skill(Some(name.into())).await);
+    assert_eq!(agent.active_skill.as_deref(), Some(name));
+    assert!(agent.registry.skills().read().await.get(name).is_some());
+    assert!(
+        agent
+            .current_skills_snapshot()
+            .get(name)
+            .unwrap()
+            .get_prompt()
+            .contains("Server-owned prompt")
+    );
+    assert!(
+        !agent
+            .set_remote_active_skill(Some("nonexistent-activation-regression".into()))
+            .await
+    );
+    assert!(agent.active_skill.is_none());
+    assert!(agent.set_remote_active_skill(None).await);
+}
+
 struct NativeCompactionStreamProvider;
 
 #[derive(Clone, Default)]

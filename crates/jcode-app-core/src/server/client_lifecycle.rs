@@ -3423,6 +3423,7 @@ async fn start_processing_message(
         .lock()
         .await
         .set_remote_active_skill(active_skill.clone())
+        .await
     {
         let skill_name = active_skill.as_deref().unwrap_or_default();
         let _ = client_event_tx.send(ServerEvent::Error {
