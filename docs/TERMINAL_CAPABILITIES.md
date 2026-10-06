@@ -3,6 +3,16 @@
 > Compiled 2026-03-02. Reflects latest stable releases of each terminal.
 > "Yes*" means supported with caveats (see notes). "No" means not supported as of latest release.
 
+## External prompt editor
+
+Press **Ctrl+G** at the chat bottom with no saved scroll bookmark to edit the unsent prompt. In scrollback, Ctrl+G retains its existing bookmark action. Pane and picker shortcuts remain unchanged.
+
+Jcode uses `$VISUAL`, then `$EDITOR`, ignoring blank values, and defaults to `vi` on Unix or `notepad` on Windows. Quoted executable paths and arguments are supported, for example `EDITOR='code --wait'`. Commands are launched directly, not through a shell, so shell expansion and pipelines are not supported. GUI editors must use their wait flag.
+
+A **successful exit** applies the file to the draft, without sending it. A **failed exit**, launch failure, deleted file, invalid UTF-8, or edited file larger than 16 MiB leaves the original draft untouched. For example, Vim's `:wq` applies and `:cq` cancels. Saving an empty file clears the draft. Ctrl+Z undoes a changed draft, attachments remain attached, and an unchanged file preserves the original cursor and collapsed pastes.
+
+The editor runs on the TUI client's host and temporarily owns the terminal. Over SSH this is the host running the TUI, not necessarily the agent daemon's host. Temporary prompt and editor backup files live in a private scratch directory that is removed when the editor returns. The client resumes with a full redraw after editing.
+
 ## Capability Matrix
 
 | Terminal | Truecolor (24-bit) | 256-color | Unicode/Emoji | Kitty Keyboard Protocol | Bracketed Paste | Mouse Capture | Alt Screen | Notable Quirks |
