@@ -3904,7 +3904,7 @@ impl App {
             // directory before reporting Unknown skill so project-local skills such
             // as .jcode/skills/optimization work immediately after reload/build.
             if skill.is_none() {
-                self.refresh_skills_snapshot();
+                let _ = self.refresh_skills_snapshot();
                 skill = self.current_skills_snapshot().get(&skill_name).cloned();
             }
 

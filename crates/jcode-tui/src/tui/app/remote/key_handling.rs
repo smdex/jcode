@@ -1058,6 +1058,12 @@ async fn handle_remote_key_internal(
                     return Ok(());
                 }
 
+                if matches!(trimmed, "/skills reload" | "/reload-skills") {
+                    remote.reload_skills().await?;
+                    app.set_status_notice("Reloading skills...");
+                    return Ok(());
+                }
+
                 if trimmed == "/reload" {
                     let client_needs_reload = app.has_newer_binary();
                     let server_needs_reload =
