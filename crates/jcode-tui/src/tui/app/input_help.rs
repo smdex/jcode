@@ -37,6 +37,9 @@ impl App {
             "refresh-model-list" => {
                 "/refresh-model-list\nForce-refresh provider model catalogs, update /model, and persist the refreshed cache."
             }
+            "skills" | "reload-skills" => {
+                "/skills\nShow installed skills and recommendations.\n\n/skills reload  or  /reload-skills\nReload installed skills from disk and refresh autocomplete. In shared-server or SSH mode, reloads the server's registry without restarting Jcode or sending a model prompt."
+            }
             "agents" => {
                 "/agents\nOpen the agent-model config picker.\n\n/agents <swarm|review|judge|memory|ambient>\nJump straight to that agent role's saved model override."
             }

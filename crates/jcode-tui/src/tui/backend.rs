@@ -617,6 +617,13 @@ impl RemoteConnection {
         Ok(id)
     }
 
+    /// Reload server skills without starting a model turn or restarting the daemon.
+    pub async fn reload_skills(&mut self) -> Result<()> {
+        let id = self.next_request_id;
+        self.next_request_id += 1;
+        self.send_request(Request::ReloadSkills { id }).await
+    }
+
     /// Request server reload
     pub async fn reload(&mut self) -> Result<()> {
         let request = Request::Reload {
