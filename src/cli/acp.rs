@@ -8,10 +8,19 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
 const ACP_PROTOCOL_VERSION: u64 = 1;
+const ACP_CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+async fn with_control_timeout<T>(
+    future: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::time::timeout(ACP_CONTROL_TIMEOUT, future)
+        .await
+        .context("Jcode daemon control request timed out after 30 seconds")?
+}
 
 const JSONRPC_PARSE_ERROR: i64 = -32700;
 const JSONRPC_INVALID_REQUEST: i64 = -32600;
@@ -85,7 +94,8 @@ impl JsonRpcMessage {
 
 struct DaemonSession {
     session_id: String,
-    reader: Mutex<BufReader<ReadHalf>>,
+    discovery_entry: Option<Value>,
+    reader: Mutex<tokio::io::Lines<BufReader<ReadHalf>>>,
     writer: Mutex<WriteHalf>,
     next_request_id: AtomicU64,
     active_prompt_id: Mutex<Option<u64>>,
@@ -101,6 +111,8 @@ struct SessionUiState {
     model: Option<String>,
     available_models: Vec<String>,
     reasoning_effort: Option<String>,
+    subagent_model: Option<String>,
+    compaction_mode: crate::config::CompactionMode,
 }
 
 #[derive(Debug, Default)]
@@ -182,6 +194,7 @@ impl SessionUiState {
             model: provider_model,
             available_models,
             reasoning_effort,
+            ..Self::default()
         }
     }
 
@@ -202,7 +215,8 @@ impl DaemonSession {
     fn new(session_id: String, reader: ReadHalf, writer: WriteHalf, next_request_id: u64) -> Self {
         Self {
             session_id,
-            reader: Mutex::new(BufReader::new(reader)),
+            discovery_entry: None,
+            reader: Mutex::new(BufReader::new(reader).lines()),
             writer: Mutex::new(writer),
             next_request_id: AtomicU64::new(next_request_id),
             active_prompt_id: Mutex::new(None),
@@ -232,12 +246,14 @@ impl DaemonSession {
     }
 
     async fn read_event(&self) -> Result<ServerEvent> {
-        let mut line = String::new();
-        let mut reader = self.reader.lock().await;
-        let n = reader.read_line(&mut line).await?;
-        if n == 0 {
-            anyhow::bail!("Jcode daemon disconnected");
-        }
+        // Lines::next_line retains partial bytes if a control timeout cancels a read.
+        let line = self
+            .reader
+            .lock()
+            .await
+            .next_line()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Jcode daemon disconnected"))?;
         let event = serde_json::from_str(&line)
             .with_context(|| format!("failed to decode Jcode daemon event: {}", line.trim_end()))?;
         Ok(event)
@@ -246,12 +262,14 @@ impl DaemonSession {
 
 #[derive(Clone)]
 struct AcpRuntime {
-    stdout: Arc<Mutex<tokio::io::Stdout>>,
+    stdout: Arc<Mutex<Box<dyn AsyncWrite + Send + Unpin>>>,
     sessions: Arc<Mutex<HashMap<String, Arc<DaemonSession>>>>,
     profile: AcpProfile,
     provider_choice: ProviderChoice,
     model: Option<String>,
     provider_profile: Option<String>,
+    #[cfg(test)]
+    daemon_connections: Arc<Mutex<Vec<(ReadHalf, WriteHalf)>>>,
 }
 
 impl AcpRuntime {
@@ -262,12 +280,14 @@ impl AcpRuntime {
         provider_profile: Option<String>,
     ) -> Self {
         Self {
-            stdout: Arc::new(Mutex::new(tokio::io::stdout())),
+            stdout: Arc::new(Mutex::new(Box::new(tokio::io::stdout()))),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             profile,
             provider_choice,
             model,
             provider_profile,
+            #[cfg(test)]
+            daemon_connections: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -323,7 +343,17 @@ impl AcpRuntime {
                         .await?;
                 }
             }
+            "session/list" => self.handle_session_list(message).await?,
             "session/new" => self.handle_session_new(message).await?,
+            "session/set_mode" => {
+                self.handle_compat_config_option(
+                    message,
+                    CONFIG_ID_MODE,
+                    &["modeId"],
+                    "session/set_mode",
+                )
+                .await?
+            }
             "session/load" => self.handle_session_load(message, true).await?,
             "session/resume" => self.handle_session_load(message, false).await?,
             "session/prompt" => self.handle_session_prompt(message).await?,
@@ -373,6 +403,92 @@ impl AcpRuntime {
         Ok(())
     }
 
+    async fn handle_session_list(&self, message: JsonRpcMessage) -> Result<()> {
+        let Some(id) = message.id else { return Ok(()) };
+        let (cwd, cursor) = match list_params(&message.params) {
+            Ok(params) => params,
+            Err(error) => {
+                return self
+                    .write_error_value(id, JSONRPC_INVALID_PARAMS, error)
+                    .await;
+            }
+        };
+        // Native sessions are provisional until their first provider turn, so
+        // discovery must include live sessions that have no snapshot yet.
+        let live_sessions: Vec<Value> = self
+            .sessions
+            .lock()
+            .await
+            .values()
+            .filter_map(|session| session.discovery_entry.clone())
+            .collect();
+        let result = tokio::task::spawn_blocking(move || {
+            let dir = crate::storage::jcode_dir()?.join("sessions");
+            let mut sessions = Vec::new();
+            if dir.exists() {
+                for entry in std::fs::read_dir(dir)? {
+                    let path = entry?.path();
+                    if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                        continue;
+                    }
+                    let Some(session_id) = path.file_stem().and_then(|name| name.to_str()) else {
+                        continue;
+                    };
+                    // Metadata-only loading skips transcript allocation. Damaged snapshots
+                    // must not prevent the client from discovering healthy sessions.
+                    if let Ok(session) = crate::session::Session::load_startup_stub(session_id) {
+                        if session.is_debug {
+                            continue;
+                        }
+                        let Some(session_cwd) = session
+                            .working_dir
+                            .as_deref()
+                            .filter(|cwd| std::path::Path::new(cwd).is_absolute())
+                        else {
+                            continue;
+                        };
+                        if cwd.as_deref().is_some_and(|cwd| cwd != session_cwd) {
+                            continue;
+                        }
+                        sessions.push(json!({
+                            "sessionId": session.id,
+                            "cwd": session_cwd,
+                            "title": session.display_title_or_name(),
+                            "updatedAt": session.updated_at.to_rfc3339(),
+                        }));
+                    }
+                }
+            }
+            for session in live_sessions {
+                if cwd
+                    .as_deref()
+                    .is_some_and(|cwd| session["cwd"].as_str() != Some(cwd))
+                {
+                    continue;
+                }
+                if !sessions
+                    .iter()
+                    .any(|saved| saved["sessionId"] == session["sessionId"])
+                {
+                    sessions.push(session);
+                }
+            }
+            Ok::<_, anyhow::Error>(session_list_page(sessions, cursor.as_deref()))
+        })
+        .await?;
+        match result {
+            Ok(result) => self.write_result(id, result).await,
+            Err(error) => {
+                self.write_error_value(
+                    id,
+                    JSONRPC_INTERNAL_ERROR,
+                    format!("Failed to list sessions: {error:#}"),
+                )
+                .await
+            }
+        }
+    }
+
     async fn handle_session_new(&self, message: JsonRpcMessage) -> Result<()> {
         let Some(id) = message.id else {
             return Ok(());
@@ -391,7 +507,7 @@ impl AcpRuntime {
             return Ok(());
         }
 
-        match self.create_new_session(cwd).await {
+        match with_control_timeout(self.create_new_session(cwd)).await {
             Ok(session) => {
                 let session_id = session.session_id.clone();
                 let state = session.ui_state.lock().await.clone();
@@ -446,16 +562,21 @@ impl AcpRuntime {
             return Ok(());
         }
 
-        match self
-            .attach_existing_session(session_id.clone(), cwd, replay_history)
-            .await
+        match with_control_timeout(self.attach_existing_session(
+            session_id.clone(),
+            cwd,
+            replay_history,
+        ))
+        .await
         {
-            Ok(session) => {
+            Ok(mut session) => {
                 let state = session.ui_state.lock().await.clone();
-                self.sessions
-                    .lock()
-                    .await
-                    .insert(session.session_id.clone(), Arc::new(session));
+                let mut sessions = self.sessions.lock().await;
+                session.discovery_entry = sessions
+                    .get(&session.session_id)
+                    .and_then(|previous| previous.discovery_entry.clone());
+                sessions.insert(session.session_id.clone(), Arc::new(session));
+                drop(sessions);
                 let mut result = json!({});
                 insert_session_configuration(&mut result, &state);
                 self.write_result(id, result).await?;
@@ -523,7 +644,12 @@ impl AcpRuntime {
 
         let runtime = self.clone();
         tokio::spawn(async move {
-            let result = runtime.run_prompt(id.clone(), session, text, images).await;
+            let result = runtime
+                .run_prompt(id.clone(), Arc::clone(&session), text, images)
+                .await;
+            // The task owns cleanup exactly once, including every I/O failure.
+            cleanup_prompt_state(&session).await;
+
             if let Err(err) = result {
                 let _ = runtime
                     .write_error_value(
@@ -637,29 +763,119 @@ impl AcpRuntime {
             return Ok(());
         }
 
+        if !session_config_options(&*session.ui_state.lock().await)
+            .iter()
+            .any(|option| {
+                option["id"] == config_id
+                    && option["options"].as_array().is_some_and(|options| {
+                        options.iter().any(|option| option["value"] == value)
+                    })
+            })
+        {
+            return self
+                .write_error_value(
+                    id,
+                    JSONRPC_INVALID_PARAMS,
+                    format!("Unknown config option or unavailable value: {config_id}={value}"),
+                )
+                .await;
+        }
+
         let request_id = session.next_id();
-        let apply_result = match config_id.as_str() {
-            CONFIG_ID_MODEL => {
-                session
-                    .send(&Request::SetModel {
-                        id: request_id,
-                        model: value.clone(),
-                    })
-                    .await?;
-                wait_for_model_changed(&session, request_id).await
+        let apply_result: Result<()> = with_control_timeout(async {
+            match config_id.as_str() {
+                CONFIG_ID_MODEL => {
+                    session
+                        .send(&Request::SetModel {
+                            id: request_id,
+                            model: value.clone(),
+                        })
+                        .await?;
+                    wait_for_model_changed(&session, request_id).await
+                }
+                CONFIG_ID_EFFORT => {
+                    session
+                        .send(&Request::SetReasoningEffort {
+                            id: request_id,
+                            effort: value.clone(),
+                            target_session_id: None,
+                        })
+                        .await?;
+                    wait_for_effort_changed(&session, request_id).await
+                }
+                CONFIG_ID_MODE => {
+                    let state = session.ui_state.lock().await;
+                    let effort = if value == "solo" {
+                        state
+                            .reasoning_effort
+                            .as_deref()
+                            .filter(|effort| !effort.starts_with("swarm"))
+                            .unwrap_or("medium")
+                            .to_string()
+                    } else {
+                        value.clone()
+                    };
+                    if value == session_mode(&state) {
+                        Ok(())
+                    } else {
+                        drop(state);
+                        session
+                            .send(&Request::SetReasoningEffort {
+                                id: request_id,
+                                effort,
+                                target_session_id: None,
+                            })
+                            .await?;
+                        wait_for_effort_changed(&session, request_id).await
+                    }
+                }
+                CONFIG_ID_SUBAGENT_MODEL => {
+                    let model = (value != "inherit").then_some(value.clone());
+                    session
+                        .send(&Request::SetSubagentModel {
+                            id: request_id,
+                            model: model.clone(),
+                        })
+                        .await?;
+                    match wait_for_done(&session, request_id).await {
+                        Ok(()) => {
+                            session.ui_state.lock().await.subagent_model = model;
+                            Ok(())
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                CONFIG_ID_COMPACTION => {
+                    let mode = crate::config::CompactionMode::parse(&value)
+                        .expect("validated compaction option");
+                    session
+                        .send(&Request::SetCompactionMode {
+                            id: request_id,
+                            mode,
+                        })
+                        .await?;
+                    loop {
+                        match session.read_event().await? {
+                            ServerEvent::CompactionModeChanged { id, mode, error }
+                                if id == request_id =>
+                            {
+                                if let Some(error) = error {
+                                    break Err(anyhow::anyhow!(error));
+                                }
+                                session.ui_state.lock().await.compaction_mode = mode;
+                                break Ok(());
+                            }
+                            ServerEvent::Error { id, message, .. } if id == request_id => {
+                                break Err(anyhow::anyhow!(message));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                other => Err(anyhow::anyhow!("Unknown config option id: {other}")),
             }
-            CONFIG_ID_EFFORT => {
-                session
-                    .send(&Request::SetReasoningEffort {
-                        id: request_id,
-                        effort: value.clone(),
-                        target_session_id: None,
-                    })
-                    .await?;
-                wait_for_effort_changed(&session, request_id).await
-            }
-            other => Err(anyhow::anyhow!("Unknown config option id: {other}")),
-        };
+        })
+        .await;
 
         match apply_result {
             Ok(()) => {
@@ -667,6 +883,7 @@ impl AcpRuntime {
                 // The spec requires the full option set in the response itself.
                 self.write_result(id, json!({ "configOptions": config_options }))
                     .await?;
+                self.write_current_mode_update(&session).await?;
                 self.write_notification(
                     "session/update",
                     json!({
@@ -754,6 +971,10 @@ impl AcpRuntime {
     }
 
     async fn connect_daemon(&self) -> Result<(ReadHalf, WriteHalf)> {
+        #[cfg(test)]
+        if let Some(connection) = self.daemon_connections.lock().await.pop() {
+            return Ok(connection);
+        }
         self.ensure_daemon().await?;
         let stream = crate::server::connect_socket(&crate::server::socket_path()).await?;
         Ok(stream.into_split())
@@ -761,7 +982,7 @@ impl AcpRuntime {
 
     async fn create_new_session(&self, cwd: PathBuf) -> Result<DaemonSession> {
         let (reader, writer) = self.connect_daemon().await?;
-        let session = DaemonSession::new(String::new(), reader, writer, 2);
+        let mut session = DaemonSession::new(String::new(), reader, writer, 2);
         let subscribe_id = 1;
         session
             .send(&Request::Subscribe {
@@ -788,25 +1009,38 @@ impl AcpRuntime {
                 provider_model,
                 available_models,
                 reasoning_effort,
+                subagent_model,
+                compaction_mode,
                 ..
             } => (
                 session_id,
-                SessionUiState::from_history_fields(
-                    provider_name,
-                    provider_model,
-                    available_models,
-                    reasoning_effort,
-                ),
+                SessionUiState {
+                    subagent_model,
+                    compaction_mode,
+                    ..SessionUiState::from_history_fields(
+                        provider_name,
+                        provider_model,
+                        available_models,
+                        reasoning_effort,
+                    )
+                },
             ),
             other => anyhow::bail!("expected history after session creation, got {other:?}"),
         };
-        Ok(DaemonSession::new(
-            session_id,
-            session.reader.into_inner().into_inner(),
-            session.writer.into_inner(),
-            session.next_request_id.load(Ordering::Relaxed),
-        )
-        .with_ui_state(ui_state))
+        session.session_id = session_id;
+        session.discovery_entry = Some(json!({
+            "sessionId": session.session_id,
+            "cwd": cwd,
+            "updatedAt": chrono::Utc::now().to_rfc3339(),
+        }));
+        let mut ui_state = ui_state;
+        if let ServerEvent::History {
+            available_models, ..
+        } = request_model_catalog(&session).await?
+        {
+            ui_state.available_models = available_models;
+        }
+        Ok(session.with_ui_state(ui_state))
     }
 
     async fn attach_existing_session(
@@ -816,7 +1050,7 @@ impl AcpRuntime {
         replay_history: bool,
     ) -> Result<DaemonSession> {
         let (reader, writer) = self.connect_daemon().await?;
-        let session = DaemonSession::new(String::new(), reader, writer, 2);
+        let mut session = DaemonSession::new(String::new(), reader, writer, 2);
         let resume_id = 1;
         session
             .send(&Request::Subscribe {
@@ -844,10 +1078,13 @@ impl AcpRuntime {
                 ServerEvent::History {
                     session_id,
                     messages,
+                    images,
                     provider_name,
                     provider_model,
                     available_models,
                     reasoning_effort,
+                    subagent_model,
+                    compaction_mode,
                     ..
                 } => {
                     attached_id = session_id.clone();
@@ -857,8 +1094,10 @@ impl AcpRuntime {
                         available_models,
                         reasoning_effort,
                     );
+                    ui_state.subagent_model = subagent_model;
+                    ui_state.compaction_mode = compaction_mode;
                     if replay_history {
-                        self.replay_history(&session_id, messages).await?;
+                        self.replay_history(&session_id, messages, images).await?;
                     }
                 }
                 ServerEvent::Done { id } if id == resume_id => break,
@@ -874,40 +1113,62 @@ impl AcpRuntime {
             }
         }
 
-        Ok(DaemonSession::new(
-            attached_id,
-            session.reader.into_inner().into_inner(),
-            session.writer.into_inner(),
-            session.next_request_id.load(Ordering::Relaxed),
-        )
-        .with_ui_state(ui_state))
+        session.session_id = attached_id;
+        if let ServerEvent::History {
+            available_models, ..
+        } = request_model_catalog(&session).await?
+        {
+            ui_state.available_models = available_models;
+        }
+        Ok(session.with_ui_state(ui_state))
     }
 
     async fn replay_history(
         &self,
         session_id: &str,
         messages: Vec<crate::protocol::HistoryMessage>,
+        images: Vec<crate::session::RenderedImage>,
     ) -> Result<()> {
-        for message in messages {
-            let update_name = match message.role.as_str() {
-                "user" => "user_message_chunk",
-                "assistant" => "agent_message_chunk",
-                _ => "agent_message_chunk",
-            };
-            self.write_notification(
-                "session/update",
-                json!({
-                    "sessionId": session_id,
-                    "update": {
-                        "sessionUpdate": update_name,
-                        "content": {
-                            "type": "text",
-                            "text": message.content,
-                        }
-                    }
-                }),
-            )
-            .await?;
+        let user_indices: Vec<usize> = messages
+            .iter()
+            .enumerate()
+            .filter_map(|(index, message)| (message.role == "user").then_some(index))
+            .collect();
+        let mut image_boundaries: HashMap<usize, Vec<crate::session::RenderedImage>> =
+            HashMap::new();
+        for image in images {
+            let boundary = match &image.anchor {
+                Some(crate::session::RenderedImageAnchor::UserPrompt { ordinal }) => {
+                    user_indices.get(*ordinal).map(|index| index + 1)
+                }
+                _ => image.history_message_index,
+            }
+            .unwrap_or(messages.len())
+            .min(messages.len());
+            image_boundaries.entry(boundary).or_default().push(image);
+        }
+        for (index, message) in messages
+            .into_iter()
+            .map(Some)
+            .chain(std::iter::once(None))
+            .enumerate()
+        {
+            for image in image_boundaries.remove(&index).unwrap_or_default() {
+                self.write_notification(
+                    "session/update",
+                    json!({"sessionId": session_id, "update": history_image_update(image)}),
+                )
+                .await?;
+            }
+            if let Some(message) = message {
+                for update in history_updates(message) {
+                    self.write_notification(
+                        "session/update",
+                        json!({"sessionId": session_id, "update": update}),
+                    )
+                    .await?;
+                }
+            }
         }
         Ok(())
     }
@@ -919,12 +1180,21 @@ impl AcpRuntime {
         text: String,
         images: Vec<(String, String)>,
     ) -> Result<()> {
-        if let Some(command) = parse_acp_slash_command(&text) {
+        let command = parse_acp_slash_command(&text);
+        let subagent_prompt = match &command {
+            Some(Ok(AcpSlashCommand::Subagent(prompt))) => Some(prompt.clone()),
+            _ => None,
+        };
+        if subagent_prompt.is_none()
+            && let Some(command) = command
+        {
             let response = match command {
-                Ok(command) => self.run_session_command(&session, command).await,
+                Ok(command) => {
+                    with_control_timeout(self.run_session_command(&session, command)).await
+                }
                 Err(err) => Err(err),
             };
-            cleanup_prompt_state(&session).await;
+
             let response = response?;
             self.write_notification(
                 "session/update",
@@ -945,18 +1215,26 @@ impl AcpRuntime {
             *active = Some(prompt_id);
         }
 
-        let send_result = session
-            .send(&Request::Message {
+        let request = if let Some(prompt) = subagent_prompt {
+            Request::RunSubagent {
+                id: prompt_id,
+                prompt,
+                subagent_type: "general".into(),
+                model: None,
+                session_id: None,
+            }
+        } else {
+            Request::Message {
                 id: prompt_id,
                 content: text,
                 images,
                 system_reminder: None,
                 active_skill: None,
                 no_reply: false,
-            })
-            .await;
+            }
+        };
+        let send_result = session.send(&request).await;
         if let Err(err) = send_result {
-            cleanup_prompt_state(&session).await;
             return Err(err);
         }
 
@@ -967,7 +1245,6 @@ impl AcpRuntime {
             let event = match session.read_event().await {
                 Ok(event) => event,
                 Err(err) => {
-                    cleanup_prompt_state(&session).await;
                     return Err(err);
                 }
             };
@@ -982,7 +1259,6 @@ impl AcpRuntime {
                     stop_reason = "cancelled".to_string();
                 }
                 ServerEvent::Error { id, message, .. } if id == prompt_id => {
-                    cleanup_prompt_state(&session).await;
                     self.write_error_value(rpc_id, JSONRPC_SERVER_ERROR, message)
                         .await?;
                     return Ok(());
@@ -1023,6 +1299,7 @@ impl AcpRuntime {
                 ServerEvent::ModelChanged {
                     model,
                     provider_name,
+                    reasoning_effort,
                     error,
                     ..
                 } => {
@@ -1032,12 +1309,14 @@ impl AcpRuntime {
                         let config_options = {
                             let mut state = session.ui_state.lock().await;
                             state.model = Some(model);
+                            state.reasoning_effort = reasoning_effort;
                             if provider_name.is_some() {
                                 state.provider_name = provider_name;
                             }
                             session_config_options(&state)
                         };
                         if !config_options.is_empty() {
+                            self.write_current_mode_update(&session).await?;
                             self.write_notification(
                                 "session/update",
                                 json!({
@@ -1051,6 +1330,32 @@ impl AcpRuntime {
                             .await?;
                         }
                     }
+                }
+                ServerEvent::AvailableModelsUpdated {
+                    provider_name,
+                    provider_model,
+                    available_models,
+                    ..
+                } => {
+                    {
+                        let mut state = session.ui_state.lock().await;
+                        if provider_name.is_some() {
+                            state.provider_name = provider_name
+                        }
+                        if provider_model.is_some() {
+                            state.model = provider_model
+                        }
+                        state.available_models = available_models;
+                    }
+                    self.write_config_option_update(&session).await?;
+                }
+                ServerEvent::ReasoningEffortChanged {
+                    effort,
+                    error: None,
+                    ..
+                } => {
+                    session.ui_state.lock().await.reasoning_effort = effort;
+                    self.write_config_option_update(&session).await?;
                 }
                 other => {
                     for update in mapper.map_event(other) {
@@ -1067,7 +1372,6 @@ impl AcpRuntime {
             }
         }
 
-        cleanup_prompt_state(&session).await;
         self.write_result(rpc_id, prompt_response(&stop_reason, &turn_usage))
             .await?;
         Ok(())
@@ -1164,11 +1468,64 @@ impl AcpRuntime {
                     .unwrap_or(effort);
                 Ok(format!("Set reasoning effort to `{selected}`."))
             }
+            AcpSlashCommand::SubagentModel(None) => {
+                let state = session.ui_state.lock().await;
+                Ok(format!(
+                    "Subagent model: `{}`.",
+                    state.subagent_model.as_deref().unwrap_or("inherit")
+                ))
+            }
+            AcpSlashCommand::SubagentModel(Some(value)) => {
+                let model = (value != "inherit").then_some(value);
+                let id = session.next_id();
+                session
+                    .send(&Request::SetSubagentModel {
+                        id,
+                        model: model.clone(),
+                    })
+                    .await?;
+                wait_for_done(session, id).await?;
+                session.ui_state.lock().await.subagent_model = model;
+                self.write_config_option_update(session).await?;
+                Ok("Updated the session subagent model policy.".into())
+            }
+            AcpSlashCommand::ReloadSkills => {
+                let id = session.next_id();
+                session.send(&Request::ReloadSkills { id }).await?;
+                loop {
+                    match session.read_event().await? {
+                        ServerEvent::SkillsReloaded {
+                            id: event_id,
+                            skills,
+                            error,
+                        } if event_id == id => {
+                            if let Some(error) = error {
+                                anyhow::bail!(error)
+                            }
+                            return Ok(format!(
+                                "Reloaded {} skills: {}",
+                                skills.len(),
+                                skills.join(", ")
+                            ));
+                        }
+                        ServerEvent::Error {
+                            id: event_id,
+                            message,
+                            ..
+                        } if event_id == id => anyhow::bail!(message),
+                        _ => {}
+                    }
+                }
+            }
+            AcpSlashCommand::Subagent(_) => {
+                unreachable!("subagents use the normal streaming turn path")
+            }
         }
     }
 
     async fn write_config_option_update(&self, session: &DaemonSession) -> Result<()> {
         let config_options = session_config_options(&*session.ui_state.lock().await);
+        self.write_current_mode_update(session).await?;
         self.write_notification(
             "session/update",
             json!({
@@ -1180,6 +1537,13 @@ impl AcpRuntime {
             }),
         )
         .await
+    }
+
+    async fn write_current_mode_update(&self, session: &DaemonSession) -> Result<()> {
+        self.write_notification("session/update", json!({
+            "sessionId": session.session_id,
+            "update": {"sessionUpdate": "current_mode_update", "currentModeId": session_mode(&*session.ui_state.lock().await)}
+        })).await
     }
 
     async fn write_result(&self, id: Value, result: Value) -> Result<()> {
@@ -1245,6 +1609,86 @@ async fn cleanup_prompt_state(session: &DaemonSession) {
     session.prompt_running.store(false, Ordering::SeqCst);
 }
 
+fn list_params(params: &Value) -> std::result::Result<(Option<String>, Option<String>), String> {
+    let optional_string = |field: &str| match params.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) if !value.is_empty() => Ok(Some(value.clone())),
+        _ => Err(format!("session/list {field} must be a non-empty string")),
+    };
+    let cwd = optional_string("cwd")?;
+    if cwd
+        .as_deref()
+        .is_some_and(|cwd| !std::path::Path::new(cwd).is_absolute())
+    {
+        return Err("session/list cwd must be absolute".into());
+    }
+    let cursor = optional_string("cursor")?;
+    if let Some(cursor) = &cursor {
+        serde_json::from_str::<(String, String)>(cursor)
+            .map_err(|_| "Invalid session/list cursor".to_string())?;
+    }
+    Ok((cwd, cursor))
+}
+
+fn session_list_page(mut sessions: Vec<Value>, cursor: Option<&str>) -> Value {
+    const PAGE_SIZE: usize = 50;
+    sessions.sort_by(|a, b| {
+        b["updatedAt"]
+            .as_str()
+            .cmp(&a["updatedAt"].as_str())
+            .then_with(|| a["sessionId"].as_str().cmp(&b["sessionId"].as_str()))
+    });
+    if let Some((updated_at, session_id)) =
+        cursor.and_then(|cursor| serde_json::from_str::<(String, String)>(cursor).ok())
+    {
+        sessions.retain(|session| {
+            let updated = session["updatedAt"].as_str().unwrap_or_default();
+            updated < updated_at.as_str()
+                || (updated == updated_at
+                    && session["sessionId"].as_str().unwrap_or_default() > session_id.as_str())
+        });
+    }
+    let more = sessions.len() > PAGE_SIZE;
+    sessions.truncate(PAGE_SIZE);
+    let next_cursor = more.then(|| {
+        let last = sessions.last().expect("a full page");
+        serde_json::to_string(&(last["updatedAt"].as_str(), last["sessionId"].as_str()))
+            .expect("string cursor")
+    });
+    let mut result = json!({"sessions": sessions});
+    if let Some(cursor) = next_cursor {
+        result["nextCursor"] = json!(cursor);
+    }
+    result
+}
+
+fn history_updates(message: crate::protocol::HistoryMessage) -> Vec<Value> {
+    match message.role.as_str() {
+        "user" | "assistant" => vec![json!({
+            "sessionUpdate": if message.role == "user" { "user_message_chunk" } else { "agent_message_chunk" },
+            "content": {"type": "text", "text": message.content},
+        })],
+        "tool" => message.tool_data.map(|tool| vec![json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": tool.id,
+            "title": tool.intent.as_deref().unwrap_or(&tool.name),
+            "kind": tool_kind(&tool.name),
+            "status": "completed",
+            "rawInput": tool.input,
+            "content": [{"type": "content", "content": {"type": "text", "text": message.content}}],
+        })]).unwrap_or_default(),
+        // Never present hidden system context or an unknown role as assistant speech.
+        _ => Vec::new(),
+    }
+}
+
+fn history_image_update(image: crate::session::RenderedImage) -> Value {
+    json!({
+        "sessionUpdate": if matches!(image.source, crate::session::RenderedImageSource::UserInput) { "user_message_chunk" } else { "agent_message_chunk" },
+        "content": {"type": "image", "mimeType": image.media_type, "data": image.data},
+    })
+}
+
 async fn wait_for_done(session: &DaemonSession, request_id: u64) -> Result<()> {
     loop {
         match session.read_event().await? {
@@ -1301,6 +1745,9 @@ async fn request_model_catalog(session: &DaemonSession) -> Result<ServerEvent> {
 
 const CONFIG_ID_MODEL: &str = "model";
 const CONFIG_ID_EFFORT: &str = "reasoning_effort";
+const CONFIG_ID_MODE: &str = "mode";
+const CONFIG_ID_SUBAGENT_MODEL: &str = "subagent_model";
+const CONFIG_ID_COMPACTION: &str = "compaction_mode";
 
 fn acp_available_commands() -> Vec<Value> {
     vec![
@@ -1316,8 +1763,11 @@ fn acp_available_commands() -> Vec<Value> {
         json!({
             "name": "effort",
             "description": "Set reasoning effort, or show the current effort",
-            "input": { "hint": "none|minimal|low|medium|high|xhigh|max (optional)" },
+            "input": { "hint": "none|minimal|low|medium|high|xhigh|max|swarm|swarm-deep (optional)" },
         }),
+        json!({"name": "subagent", "description": "Launch a general subagent with streamed tool progress", "input": {"hint": "prompt"}}),
+        json!({"name": "subagent-model", "description": "Set the session subagent model policy", "input": {"hint": "model id|inherit (optional)"}}),
+        json!({"name": "skills", "description": "Reload installed skills in the current daemon session", "input": {"hint": "reload"}}),
     ]
 }
 
@@ -1330,6 +1780,7 @@ fn insert_session_configuration(result: &mut Value, state: &SessionUiState) {
         object.insert("configOptions".to_string(), Value::Array(config_options));
     }
     if let Some(models) = session_models(state) {
+        insert_session_modes(object, state);
         object.insert("models".to_string(), models);
     }
 }
@@ -1354,10 +1805,34 @@ fn available_efforts(state: &SessionUiState) -> Vec<&'static str> {
         state.provider_name.as_deref(),
         state.model.as_deref(),
     )
-    .into_iter()
-    // `swarm`/`swarm-deep` are TUI sentinels, not provider effort levels.
-    .filter(|effort| !effort.starts_with("swarm"))
-    .collect()
+}
+
+fn session_mode(state: &SessionUiState) -> &str {
+    match state.reasoning_effort.as_deref() {
+        Some("swarm") => "swarm",
+        Some("swarm-deep") => "swarm-deep",
+        _ => "solo",
+    }
+}
+
+fn mode_options(state: &SessionUiState) -> Vec<Value> {
+    let mut modes = vec![
+        json!({"value": "solo", "name": "Solo", "description": "Normal agent execution with the selected provider effort"}),
+    ];
+    for effort in available_efforts(state)
+        .into_iter()
+        .filter(|effort| effort.starts_with("swarm"))
+    {
+        modes.push(json!({"value": effort, "name": if effort == "swarm" { "Swarm" } else { "Swarm Deep" }, "description": if effort == "swarm" { "Light parallel fan-out, only the root spawns workers" } else { "Deep task graph with recursive worker coordination" }}));
+    }
+    modes
+}
+
+fn insert_session_modes(object: &mut serde_json::Map<String, Value>, state: &SessionUiState) {
+    object.insert("modes".into(), json!({
+        "currentModeId": session_mode(state),
+        "availableModes": mode_options(state).into_iter().map(|mode| json!({"id": mode["value"], "name": mode["name"], "description": mode["description"]})).collect::<Vec<_>>()
+    }));
 }
 
 /// Build the ACP `configOptions` array (model selector plus reasoning effort)
@@ -1383,21 +1858,41 @@ fn session_config_options(state: &SessionUiState) -> Vec<Value> {
             "currentValue": model,
             "options": select_options,
         }));
+        options.push(json!({
+            "type": "select", "id": CONFIG_ID_MODE, "name": "Operation mode", "category": "mode",
+            "description": "Native orchestration, not a permission or read-only policy. Leaving swarm selects medium effort.",
+            "currentValue": session_mode(state), "options": mode_options(state),
+        }));
+        let mut subagent_models = vec![json!({"value": "inherit", "name": "Inherit active model"})];
+        if let Some(model) = state
+            .subagent_model
+            .as_ref()
+            .filter(|model| !models.contains(model))
+        {
+            models.push(model.clone());
+        }
+        subagent_models.extend(
+            models
+                .iter()
+                .map(|model| json!({"value": model, "name": model})),
+        );
+        options.push(json!({
+            "type": "select", "id": CONFIG_ID_SUBAGENT_MODEL, "name": "Subagent model", "category": "_subagent",
+            "currentValue": state.subagent_model.as_deref().unwrap_or("inherit"), "options": subagent_models,
+        }));
+        options.push(json!({
+            "type": "select", "id": CONFIG_ID_COMPACTION, "name": "Context compaction", "category": "_context",
+            "currentValue": state.compaction_mode.as_str(),
+            "options": (["reactive", "proactive", "semantic"].map(|mode| json!({"value": mode, "name": mode}))),
+        }));
     }
 
     let efforts = available_efforts(state);
-    if !efforts.is_empty() {
-        let current = state
-            .reasoning_effort
-            .as_deref()
-            .filter(|effort| efforts.contains(effort))
-            .unwrap_or_else(|| {
-                if efforts.contains(&"medium") {
-                    "medium"
-                } else {
-                    efforts[0]
-                }
-            });
+    if let Some(current) = state
+        .reasoning_effort
+        .as_deref()
+        .filter(|effort| efforts.contains(effort))
+    {
         let select_options: Vec<Value> = efforts
             .iter()
             .map(|name| json!({ "value": name, "name": name }))
@@ -1423,6 +1918,7 @@ async fn wait_for_model_changed(session: &DaemonSession, request_id: u64) -> Res
                 id,
                 model,
                 provider_name,
+                reasoning_effort,
                 error,
                 ..
             } if id == request_id => {
@@ -1431,6 +1927,7 @@ async fn wait_for_model_changed(session: &DaemonSession, request_id: u64) -> Res
                 }
                 let mut state = session.ui_state.lock().await;
                 state.model = Some(model);
+                state.reasoning_effort = reasoning_effort;
                 if provider_name.is_some() {
                     state.provider_name = provider_name;
                 }
@@ -1469,6 +1966,7 @@ struct EventMapper {
     profile: AcpProfile,
     current_tool_id: Option<String>,
     tool_inputs: HashMap<String, String>,
+    worker_status: HashMap<String, String>,
 }
 
 impl EventMapper {
@@ -1478,12 +1976,53 @@ impl EventMapper {
             profile,
             current_tool_id: None,
             tool_inputs: HashMap::new(),
+            worker_status: HashMap::new(),
         }
     }
 
     fn map_event(&mut self, event: ServerEvent) -> Vec<Value> {
         match event {
             ServerEvent::TextDelta { text } => vec![agent_message_chunk(text)],
+            ServerEvent::ReasoningDelta { text } => vec![
+                json!({"sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": text}}),
+            ],
+            ServerEvent::SwarmStatus { members } => {
+                let mut updates = Vec::new();
+                for member in members {
+                    if member.report_back_to_session_id.as_deref() != Some(&self.session_id) {
+                        continue;
+                    }
+                    let id = format!("swarm/{}", member.session_id);
+                    let status = match member.status.as_str() {
+                        "completed" => "completed",
+                        "ready" | "idle" => "pending",
+                        "failed" | "stopped" | "error" => "failed",
+                        _ => "in_progress",
+                    };
+                    let text = member
+                        .output_tail
+                        .as_deref()
+                        .or(member.detail.as_deref())
+                        .unwrap_or(&member.status);
+                    let signature = format!("{status}:{text}");
+                    if self.worker_status.get(&id) == Some(&signature) {
+                        continue;
+                    }
+                    let update_type = if self.worker_status.insert(id.clone(), signature).is_some()
+                    {
+                        "tool_call_update"
+                    } else {
+                        "tool_call"
+                    };
+                    updates.push(json!({
+                        "sessionUpdate": update_type, "toolCallId": id, "kind": "other", "status": status,
+                        "title": format!("Subagent: {}", member.task_label.as_deref().or(member.friendly_name.as_deref()).unwrap_or(&member.session_id)),
+                        "content": [{"type": "content", "content": {"type": "text", "text": text}}],
+                        "_meta": {"jcode": {"sessionId": member.session_id, "parentSessionId": member.report_back_to_session_id}},
+                    }));
+                }
+                updates
+            }
             ServerEvent::TextReplace { text } => vec![agent_message_chunk(text)],
             ServerEvent::ToolStart { id, name } => {
                 self.current_tool_id = Some(id.clone());
@@ -1496,8 +2035,8 @@ impl EventMapper {
                     "status": "pending",
                 })]
             }
-            ServerEvent::ToolInput { delta, .. } => {
-                let Some(tool_id) = self.current_tool_id.clone() else {
+            ServerEvent::ToolInput { id, delta } => {
+                let Some(tool_id) = id.or_else(|| self.current_tool_id.clone()) else {
                     return Vec::new();
                 };
                 let buffer = self.tool_inputs.entry(tool_id.clone()).or_default();
@@ -1648,6 +2187,7 @@ fn initialize_result(params: &Value, profile: AcpProfile) -> Value {
             "sse": false,
         },
         "sessionCapabilities": {
+            "list": {},
             "close": {},
             "resume": {},
         }
@@ -1715,6 +2255,9 @@ enum AcpSlashCommand {
     Model(Option<String>),
     Models,
     Effort(Option<String>),
+    Subagent(String),
+    SubagentModel(Option<String>),
+    ReloadSkills,
 }
 
 fn parse_acp_slash_command(text: &str) -> Option<Result<AcpSlashCommand>> {
@@ -1734,6 +2277,16 @@ fn parse_acp_slash_command(text: &str) -> Option<Result<AcpSlashCommand>> {
         "models" if argument.is_none() => Some(Ok(AcpSlashCommand::Models)),
         "models" => Some(Err(anyhow::anyhow!("/models does not accept an argument"))),
         "effort" => Some(Ok(AcpSlashCommand::Effort(argument))),
+        "subagent-model" => Some(Ok(AcpSlashCommand::SubagentModel(argument))),
+        "subagent" => Some(
+            argument
+                .map(AcpSlashCommand::Subagent)
+                .ok_or_else(|| anyhow::anyhow!("/subagent requires a prompt")),
+        ),
+        "skills" if argument.as_deref() == Some("reload") => {
+            Some(Ok(AcpSlashCommand::ReloadSkills))
+        }
+        "skills" => Some(Err(anyhow::anyhow!("ACP supports /skills reload"))),
         _ => None,
     }
 }
@@ -1883,6 +2436,10 @@ pub(crate) async fn run_acp_command(
 }
 
 #[cfg(test)]
+#[path = "acp_protocol_tests.rs"]
+mod protocol_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::path::Path;
@@ -2027,7 +2584,17 @@ mod tests {
             .iter()
             .map(|command| command["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names, ["model", "models", "effort"]);
+        assert_eq!(
+            names,
+            [
+                "model",
+                "models",
+                "effort",
+                "subagent",
+                "subagent-model",
+                "skills"
+            ]
+        );
         assert_eq!(commands[0]["input"]["hint"], "model id (optional)");
         assert!(commands[1].get("input").is_none());
         assert!(
@@ -2110,9 +2677,10 @@ mod tests {
             model: Some("gpt-5.2".to_string()),
             available_models: vec!["gpt-5.2".to_string(), "gpt-5.2-codex".to_string()],
             reasoning_effort: Some("high".to_string()),
+            ..SessionUiState::default()
         };
         let options = session_config_options(&state);
-        assert_eq!(options.len(), 2);
+        assert_eq!(options.len(), 5);
 
         let model = &options[0];
         assert_eq!(model["id"], CONFIG_ID_MODEL);
@@ -2121,7 +2689,10 @@ mod tests {
         assert_eq!(model["currentValue"], "gpt-5.2");
         assert_eq!(model["options"].as_array().unwrap().len(), 2);
 
-        let effort = &options[1];
+        let effort = options
+            .iter()
+            .find(|option| option["id"] == CONFIG_ID_EFFORT)
+            .unwrap();
         assert_eq!(effort["id"], CONFIG_ID_EFFORT);
         assert_eq!(effort["category"], "thought_level");
         assert_eq!(effort["currentValue"], "high");
@@ -2132,10 +2703,8 @@ mod tests {
             .map(|option| option["value"].as_str().unwrap())
             .collect();
         assert!(effort_values.contains(&"medium"));
-        assert!(
-            !effort_values.iter().any(|value| value.starts_with("swarm")),
-            "swarm sentinels are TUI-only and must not leak over ACP: {effort_values:?}"
-        );
+        assert!(effort_values.contains(&"swarm"));
+        assert!(effort_values.contains(&"swarm-deep"));
     }
 
     #[test]
@@ -2145,6 +2714,7 @@ mod tests {
             model: Some("claude-opus-4-6".to_string()),
             available_models: vec!["claude-sonnet-4-5".to_string()],
             reasoning_effort: None,
+            ..SessionUiState::default()
         };
         let options = session_config_options(&state);
         let model_values: Vec<&str> = options[0]["options"]
@@ -2164,6 +2734,7 @@ mod tests {
             model: Some("deepseek-v4-flash".to_string()),
             available_models: vec!["deepseek-v4-pro".to_string()],
             reasoning_effort: Some("high".to_string()),
+            ..SessionUiState::default()
         };
         let mut result = json!({"sessionId": "s1"});
         insert_session_configuration(&mut result, &state);
@@ -2192,6 +2763,7 @@ mod tests {
             model: Some("mystery-model-9000".to_string()),
             available_models: Vec::new(),
             reasoning_effort: None,
+            ..SessionUiState::default()
         };
         assert_eq!(
             state.context_limit(),
