@@ -1130,6 +1130,12 @@ pub(in crate::tui::app) async fn submit_remote_enter_input(
             return Ok(());
         }
 
+        if matches!(trimmed, "/skills reload" | "/reload-skills") {
+            remote.reload_skills().await?;
+            app.set_status_notice("Reloading skills...");
+            return Ok(());
+        }
+
         if trimmed == "/reload" {
             let client_needs_reload = app.has_newer_binary();
             let server_needs_reload = app.remote_server_has_update.unwrap_or(client_needs_reload);
