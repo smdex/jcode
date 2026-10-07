@@ -988,6 +988,41 @@ fn skills_command_refreshes_registry_from_disk_before_listing() {
 }
 
 #[test]
+fn skill_reload_commands_are_local_controls_and_autocomplete() {
+    let mut app = create_test_app();
+    assert!(
+        app.get_suggestions_for("/reload-sk")
+            .iter()
+            .any(|(name, _)| name == "/reload-skills")
+    );
+    for command in ["/skills reload", "/reload-skills"] {
+        assert!(super::commands_dispatch::dispatch_local_command(
+            &mut app, command
+        ));
+        assert!(
+            app.display_messages()
+                .last()
+                .unwrap()
+                .content
+                .contains("Reloaded")
+        );
+        assert!(!app.is_processing);
+    }
+    app.is_remote = true;
+    assert!(super::state_ui::handle_info_command(
+        &mut app,
+        "/skills reload"
+    ));
+    assert!(
+        app.display_messages()
+            .last()
+            .unwrap()
+            .content
+            .contains("Reconnect")
+    );
+}
+
+#[test]
 fn skill_invocation_with_prompt_activates_and_submits_in_one_turn() {
     let mut app = create_test_app();
     let temp = tempfile::tempdir().expect("tempdir");
