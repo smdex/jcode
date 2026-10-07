@@ -460,6 +460,37 @@ fn test_resume_all_sessions_request_roundtrip() -> Result<()> {
 }
 
 #[test]
+fn test_reload_skills_request_and_response_roundtrip() -> Result<()> {
+    let request = Request::ReloadSkills { id: 452 };
+    let request_json = serde_json::to_string(&request)?;
+    assert!(request_json.contains("\"type\":\"reload_skills\""));
+    assert!(matches!(
+        parse_request_json(&request_json)?,
+        Request::ReloadSkills { id: 452 }
+    ));
+    assert_eq!(request.id(), 452);
+    for error in [None, Some("disk unavailable".to_string())] {
+        let event = ServerEvent::SkillsReloaded {
+            id: 452,
+            skills: vec!["ponytail".into()],
+            error: error.clone(),
+        };
+        let ServerEvent::SkillsReloaded {
+            id,
+            skills,
+            error: actual_error,
+        } = parse_event_json(&serde_json::to_string(&event)?)?
+        else {
+            return Err(anyhow!("expected SkillsReloaded"));
+        };
+        assert_eq!(id, 452);
+        assert_eq!(skills, vec!["ponytail"]);
+        assert_eq!(actual_error, error);
+    }
+    Ok(())
+}
+
+#[test]
 fn test_resume_all_result_event_roundtrip() -> Result<()> {
     let event = ServerEvent::ResumeAllResult {
         id: 451,

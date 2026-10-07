@@ -225,7 +225,7 @@ pub(in crate::tui::app) async fn submit_remote_slash_input(
     let skill_name = invocation.name.to_string();
     let mut skill = snapshot.get(&skill_name).cloned();
     if skill.is_none() {
-        app.refresh_skills_snapshot();
+        let _ = app.refresh_skills_snapshot();
         skill = app.current_skills_snapshot().get(&skill_name).cloned();
     }
     if skill.is_none() {
