@@ -8,10 +8,19 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
 const ACP_PROTOCOL_VERSION: u64 = 1;
+const ACP_CONTROL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+async fn with_control_timeout<T>(
+    future: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::time::timeout(ACP_CONTROL_TIMEOUT, future)
+        .await
+        .context("Jcode daemon control request timed out after 30 seconds")?
+}
 
 const JSONRPC_PARSE_ERROR: i64 = -32700;
 const JSONRPC_INVALID_REQUEST: i64 = -32600;
@@ -85,7 +94,8 @@ impl JsonRpcMessage {
 
 struct DaemonSession {
     session_id: String,
-    reader: Mutex<BufReader<ReadHalf>>,
+    discovery_entry: Option<Value>,
+    reader: Mutex<tokio::io::Lines<BufReader<ReadHalf>>>,
     writer: Mutex<WriteHalf>,
     next_request_id: AtomicU64,
     active_prompt_id: Mutex<Option<u64>>,
@@ -107,6 +117,8 @@ struct SessionUiState {
     model: Option<String>,
     available_models: Vec<String>,
     reasoning_effort: Option<String>,
+    subagent_model: Option<String>,
+    compaction_mode: crate::config::CompactionMode,
 }
 
 #[derive(Debug, Default)]
@@ -218,6 +230,7 @@ impl SessionUiState {
             model: provider_model,
             available_models,
             reasoning_effort,
+            ..Self::default()
         }
     }
 
@@ -238,7 +251,8 @@ impl DaemonSession {
     fn new(session_id: String, reader: ReadHalf, writer: WriteHalf, next_request_id: u64) -> Self {
         Self {
             session_id,
-            reader: Mutex::new(BufReader::new(reader)),
+            discovery_entry: None,
+            reader: Mutex::new(BufReader::new(reader).lines()),
             writer: Mutex::new(writer),
             next_request_id: AtomicU64::new(next_request_id),
             active_prompt_id: Mutex::new(None),
@@ -284,12 +298,14 @@ impl DaemonSession {
     }
 
     async fn read_event(&self) -> Result<ServerEvent> {
-        let mut line = String::new();
-        let mut reader = self.reader.lock().await;
-        let n = reader.read_line(&mut line).await?;
-        if n == 0 {
-            anyhow::bail!("Jcode daemon disconnected");
-        }
+        // Lines::next_line retains partial bytes if a control timeout cancels a read.
+        let line = self
+            .reader
+            .lock()
+            .await
+            .next_line()
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Jcode daemon disconnected"))?;
         let event = serde_json::from_str(&line)
             .with_context(|| format!("failed to decode Jcode daemon event: {}", line.trim_end()))?;
         Ok(event)
@@ -298,12 +314,14 @@ impl DaemonSession {
 
 #[derive(Clone)]
 struct AcpRuntime {
-    stdout: Arc<Mutex<tokio::io::Stdout>>,
+    stdout: Arc<Mutex<Box<dyn AsyncWrite + Send + Unpin>>>,
     sessions: Arc<Mutex<HashMap<String, Arc<DaemonSession>>>>,
     profile: AcpProfile,
     provider_choice: ProviderChoice,
     model: Option<String>,
     provider_profile: Option<String>,
+    #[cfg(test)]
+    daemon_connections: Arc<Mutex<Vec<(ReadHalf, WriteHalf)>>>,
 }
 
 impl AcpRuntime {
@@ -314,12 +332,14 @@ impl AcpRuntime {
         provider_profile: Option<String>,
     ) -> Self {
         Self {
-            stdout: Arc::new(Mutex::new(tokio::io::stdout())),
+            stdout: Arc::new(Mutex::new(Box::new(tokio::io::stdout()))),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             profile,
             provider_choice,
             model,
             provider_profile,
+            #[cfg(test)]
+            daemon_connections: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -375,7 +395,17 @@ impl AcpRuntime {
                         .await?;
                 }
             }
+            "session/list" => self.handle_session_list(message).await?,
             "session/new" => self.handle_session_new(message).await?,
+            "session/set_mode" => {
+                self.handle_compat_config_option(
+                    message,
+                    CONFIG_ID_MODE,
+                    &["modeId"],
+                    "session/set_mode",
+                )
+                .await?
+            }
             "session/load" => self.handle_session_load(message, true).await?,
             "session/resume" => self.handle_session_load(message, false).await?,
             "session/prompt" => self.handle_session_prompt(message).await?,
@@ -425,6 +455,92 @@ impl AcpRuntime {
         Ok(())
     }
 
+    async fn handle_session_list(&self, message: JsonRpcMessage) -> Result<()> {
+        let Some(id) = message.id else { return Ok(()) };
+        let (cwd, cursor) = match list_params(&message.params) {
+            Ok(params) => params,
+            Err(error) => {
+                return self
+                    .write_error_value(id, JSONRPC_INVALID_PARAMS, error)
+                    .await;
+            }
+        };
+        // Native sessions are provisional until their first provider turn, so
+        // discovery must include live sessions that have no snapshot yet.
+        let live_sessions: Vec<Value> = self
+            .sessions
+            .lock()
+            .await
+            .values()
+            .filter_map(|session| session.discovery_entry.clone())
+            .collect();
+        let result = tokio::task::spawn_blocking(move || {
+            let dir = crate::storage::jcode_dir()?.join("sessions");
+            let mut sessions = Vec::new();
+            if dir.exists() {
+                for entry in std::fs::read_dir(dir)? {
+                    let path = entry?.path();
+                    if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                        continue;
+                    }
+                    let Some(session_id) = path.file_stem().and_then(|name| name.to_str()) else {
+                        continue;
+                    };
+                    // Metadata-only loading skips transcript allocation. Damaged snapshots
+                    // must not prevent the client from discovering healthy sessions.
+                    if let Ok(session) = crate::session::Session::load_startup_stub(session_id) {
+                        if session.is_debug {
+                            continue;
+                        }
+                        let Some(session_cwd) = session
+                            .working_dir
+                            .as_deref()
+                            .filter(|cwd| std::path::Path::new(cwd).is_absolute())
+                        else {
+                            continue;
+                        };
+                        if cwd.as_deref().is_some_and(|cwd| cwd != session_cwd) {
+                            continue;
+                        }
+                        sessions.push(json!({
+                            "sessionId": session.id,
+                            "cwd": session_cwd,
+                            "title": session.display_title_or_name(),
+                            "updatedAt": session.updated_at.to_rfc3339(),
+                        }));
+                    }
+                }
+            }
+            for session in live_sessions {
+                if cwd
+                    .as_deref()
+                    .is_some_and(|cwd| session["cwd"].as_str() != Some(cwd))
+                {
+                    continue;
+                }
+                if !sessions
+                    .iter()
+                    .any(|saved| saved["sessionId"] == session["sessionId"])
+                {
+                    sessions.push(session);
+                }
+            }
+            Ok::<_, anyhow::Error>(session_list_page(sessions, cursor.as_deref()))
+        })
+        .await?;
+        match result {
+            Ok(result) => self.write_result(id, result).await,
+            Err(error) => {
+                self.write_error_value(
+                    id,
+                    JSONRPC_INTERNAL_ERROR,
+                    format!("Failed to list sessions: {error:#}"),
+                )
+                .await
+            }
+        }
+    }
+
     async fn handle_session_new(&self, message: JsonRpcMessage) -> Result<()> {
         let Some(id) = message.id else {
             return Ok(());
@@ -443,7 +559,7 @@ impl AcpRuntime {
             return Ok(());
         }
 
-        match self.create_new_session(cwd).await {
+        match with_control_timeout(self.create_new_session(cwd)).await {
             Ok(session) => {
                 let session_id = session.session_id.clone();
                 let state = session.ui_state.lock().await.clone();
@@ -498,16 +614,21 @@ impl AcpRuntime {
             return Ok(());
         }
 
-        match self
-            .attach_existing_session(session_id.clone(), cwd, replay_history)
-            .await
+        match with_control_timeout(self.attach_existing_session(
+            session_id.clone(),
+            cwd,
+            replay_history,
+        ))
+        .await
         {
-            Ok(session) => {
+            Ok(mut session) => {
                 let state = session.ui_state.lock().await.clone();
-                self.sessions
-                    .lock()
-                    .await
-                    .insert(session.session_id.clone(), Arc::new(session));
+                let mut sessions = self.sessions.lock().await;
+                session.discovery_entry = sessions
+                    .get(&session.session_id)
+                    .and_then(|previous| previous.discovery_entry.clone());
+                sessions.insert(session.session_id.clone(), Arc::new(session));
+                drop(sessions);
                 let mut result = json!({});
                 insert_session_configuration(&mut result, &state);
                 self.write_result(id, result).await?;
@@ -577,8 +698,10 @@ impl AcpRuntime {
         let runtime = self.clone();
         tokio::spawn(async move {
             let result = runtime
-                .run_prompt(id.clone(), session, text, images, explicit_skill)
+                .run_prompt(id.clone(), Arc::clone(&session), text, images, explicit_skill)
                 .await;
+            // The task owns cleanup exactly once, including every I/O failure.
+            cleanup_prompt_state(&session).await;
             if let Err(err) = result {
                 let _ = runtime
                     .write_error_value(
@@ -692,29 +815,119 @@ impl AcpRuntime {
             return Ok(());
         }
 
+        if !session_config_options(&*session.ui_state.lock().await)
+            .iter()
+            .any(|option| {
+                option["id"] == config_id
+                    && option["options"].as_array().is_some_and(|options| {
+                        options.iter().any(|option| option["value"] == value)
+                    })
+            })
+        {
+            return self
+                .write_error_value(
+                    id,
+                    JSONRPC_INVALID_PARAMS,
+                    format!("Unknown config option or unavailable value: {config_id}={value}"),
+                )
+                .await;
+        }
+
         let request_id = session.next_id();
-        let apply_result = match config_id.as_str() {
-            CONFIG_ID_MODEL => {
-                session
-                    .send(&Request::SetModel {
-                        id: request_id,
-                        model: value.clone(),
-                    })
-                    .await?;
-                wait_for_model_changed(&session, request_id).await
+        let apply_result: Result<()> = with_control_timeout(async {
+            match config_id.as_str() {
+                CONFIG_ID_MODEL => {
+                    session
+                        .send(&Request::SetModel {
+                            id: request_id,
+                            model: value.clone(),
+                        })
+                        .await?;
+                    wait_for_model_changed(&session, request_id).await
+                }
+                CONFIG_ID_EFFORT => {
+                    session
+                        .send(&Request::SetReasoningEffort {
+                            id: request_id,
+                            effort: value.clone(),
+                            target_session_id: None,
+                        })
+                        .await?;
+                    wait_for_effort_changed(&session, request_id).await
+                }
+                CONFIG_ID_MODE => {
+                    let state = session.ui_state.lock().await;
+                    let effort = if value == "solo" {
+                        state
+                            .reasoning_effort
+                            .as_deref()
+                            .filter(|effort| !effort.starts_with("swarm"))
+                            .unwrap_or("medium")
+                            .to_string()
+                    } else {
+                        value.clone()
+                    };
+                    if value == session_mode(&state) {
+                        Ok(())
+                    } else {
+                        drop(state);
+                        session
+                            .send(&Request::SetReasoningEffort {
+                                id: request_id,
+                                effort,
+                                target_session_id: None,
+                            })
+                            .await?;
+                        wait_for_effort_changed(&session, request_id).await
+                    }
+                }
+                CONFIG_ID_SUBAGENT_MODEL => {
+                    let model = (value != "inherit").then_some(value.clone());
+                    session
+                        .send(&Request::SetSubagentModel {
+                            id: request_id,
+                            model: model.clone(),
+                        })
+                        .await?;
+                    match wait_for_done(&session, request_id).await {
+                        Ok(()) => {
+                            session.ui_state.lock().await.subagent_model = model;
+                            Ok(())
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+                CONFIG_ID_COMPACTION => {
+                    let mode = crate::config::CompactionMode::parse(&value)
+                        .expect("validated compaction option");
+                    session
+                        .send(&Request::SetCompactionMode {
+                            id: request_id,
+                            mode,
+                        })
+                        .await?;
+                    loop {
+                        match session.read_event().await? {
+                            ServerEvent::CompactionModeChanged { id, mode, error }
+                                if id == request_id =>
+                            {
+                                if let Some(error) = error {
+                                    break Err(anyhow::anyhow!(error));
+                                }
+                                session.ui_state.lock().await.compaction_mode = mode;
+                                break Ok(());
+                            }
+                            ServerEvent::Error { id, message, .. } if id == request_id => {
+                                break Err(anyhow::anyhow!(message));
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                other => Err(anyhow::anyhow!("Unknown config option id: {other}")),
             }
-            CONFIG_ID_EFFORT => {
-                session
-                    .send(&Request::SetReasoningEffort {
-                        id: request_id,
-                        effort: value.clone(),
-                        target_session_id: None,
-                    })
-                    .await?;
-                wait_for_effort_changed(&session, request_id).await
-            }
-            other => Err(anyhow::anyhow!("Unknown config option id: {other}")),
-        };
+        })
+        .await;
 
         match apply_result {
             Ok(()) => {
@@ -722,6 +935,7 @@ impl AcpRuntime {
                 // The spec requires the full option set in the response itself.
                 self.write_result(id, json!({ "configOptions": config_options }))
                     .await?;
+                self.write_current_mode_update(&session).await?;
                 self.write_notification(
                     "session/update",
                     json!({
@@ -816,6 +1030,10 @@ impl AcpRuntime {
     }
 
     async fn connect_daemon(&self) -> Result<(ReadHalf, WriteHalf)> {
+        #[cfg(test)]
+        if let Some(connection) = self.daemon_connections.lock().await.pop() {
+            return Ok(connection);
+        }
         self.ensure_daemon().await?;
         let stream = crate::server::connect_socket(&crate::server::socket_path()).await?;
         Ok(stream.into_split())
@@ -832,7 +1050,7 @@ impl AcpRuntime {
         reader: ReadHalf,
         writer: WriteHalf,
     ) -> Result<DaemonSession> {
-        let session = DaemonSession::new(String::new(), reader, writer, 2);
+        let mut session = DaemonSession::new(String::new(), reader, writer, 2);
         let subscribe_id = 1;
         session
             .send(&Request::Subscribe {
@@ -862,26 +1080,42 @@ impl AcpRuntime {
                 provider_model,
                 available_models,
                 reasoning_effort,
+                subagent_model,
+                compaction_mode,
                 ..
             } => (
                 session_id,
-                SessionUiState::from_history_fields(
-                    provider_name,
-                    provider_model,
-                    available_models,
-                    reasoning_effort,
-                ),
+                SessionUiState {
+                    subagent_model,
+                    compaction_mode,
+                    ..SessionUiState::from_history_fields(
+                        provider_name,
+                        provider_model,
+                        available_models,
+                        reasoning_effort,
+                    )
+                },
             ),
             other => anyhow::bail!("expected history after session creation, got {other:?}"),
         };
-        Ok(DaemonSession::new(
-            session_id,
-            session.reader.into_inner().into_inner(),
-            session.writer.into_inner(),
-            session.next_request_id.load(Ordering::Relaxed),
-        )
-        .with_ui_state(ui_state)
-        .with_working_dir(cwd))
+        let mut ui_state = ui_state;
+        if let ServerEvent::History {
+            available_models, ..
+        } = request_model_catalog(&session).await?
+        {
+            ui_state.available_models = available_models;
+        }
+        // Reuse the live session so bytes already buffered past the catalog
+        // reply stay readable (fresh reconstruction drops BufReader contents).
+        session.session_id = session_id.clone();
+        session.discovery_entry = Some(json!({
+            "sessionId": session_id,
+            "cwd": cwd.display().to_string(),
+            "updatedAt": chrono::Utc::now().to_rfc3339(),
+        }));
+        session.working_dir = Some(cwd);
+        *session.ui_state.lock().await = ui_state;
+        Ok(session)
     }
 
     async fn attach_existing_session(
@@ -909,7 +1143,7 @@ impl AcpRuntime {
         reader: ReadHalf,
         writer: WriteHalf,
     ) -> Result<DaemonSession> {
-        let session = DaemonSession::new(String::new(), reader, writer, 2);
+        let mut session = DaemonSession::new(String::new(), reader, writer, 2);
         let resume_id = 1;
         session
             .send(&Request::Subscribe {
@@ -940,10 +1174,13 @@ impl AcpRuntime {
                 ServerEvent::History {
                     session_id,
                     messages,
+                    images,
                     provider_name,
                     provider_model,
                     available_models,
                     reasoning_effort,
+                    subagent_model,
+                    compaction_mode,
                     ..
                 } => {
                     attached_id = session_id.clone();
@@ -953,8 +1190,10 @@ impl AcpRuntime {
                         available_models,
                         reasoning_effort,
                     );
+                    ui_state.subagent_model = subagent_model;
+                    ui_state.compaction_mode = compaction_mode;
                     if replay_history {
-                        self.replay_history(&session_id, messages).await?;
+                        self.replay_history(&session_id, messages, images).await?;
                     }
                 }
                 ServerEvent::Done { id } if id == resume_id => break,
@@ -970,41 +1209,66 @@ impl AcpRuntime {
             }
         }
 
-        Ok(DaemonSession::new(
-            attached_id,
-            session.reader.into_inner().into_inner(),
-            session.writer.into_inner(),
-            session.next_request_id.load(Ordering::Relaxed),
-        )
-        .with_ui_state(ui_state)
-        .with_working_dir(cwd))
+        let mut ui_state = ui_state;
+        if let ServerEvent::History {
+            available_models, ..
+        } = request_model_catalog(&session).await?
+        {
+            ui_state.available_models = available_models;
+        }
+        // Same live-session reuse as create_new_session: keep buffered events.
+        session.session_id = attached_id;
+        session.working_dir = Some(cwd);
+        *session.ui_state.lock().await = ui_state;
+        Ok(session)
     }
 
     async fn replay_history(
         &self,
         session_id: &str,
         messages: Vec<crate::protocol::HistoryMessage>,
+        images: Vec<crate::session::RenderedImage>,
     ) -> Result<()> {
-        for message in messages {
-            let update_name = match message.role.as_str() {
-                "user" => "user_message_chunk",
-                "assistant" => "agent_message_chunk",
-                _ => "agent_message_chunk",
-            };
-            self.write_notification(
-                "session/update",
-                json!({
-                    "sessionId": session_id,
-                    "update": {
-                        "sessionUpdate": update_name,
-                        "content": {
-                            "type": "text",
-                            "text": message.content,
-                        }
-                    }
-                }),
-            )
-            .await?;
+        let user_indices: Vec<usize> = messages
+            .iter()
+            .enumerate()
+            .filter_map(|(index, message)| (message.role == "user").then_some(index))
+            .collect();
+        let mut image_boundaries: HashMap<usize, Vec<crate::session::RenderedImage>> =
+            HashMap::new();
+        for image in images {
+            let boundary = match &image.anchor {
+                Some(crate::session::RenderedImageAnchor::UserPrompt { ordinal }) => {
+                    user_indices.get(*ordinal).map(|index| index + 1)
+                }
+                _ => image.history_message_index,
+            }
+            .unwrap_or(messages.len())
+            .min(messages.len());
+            image_boundaries.entry(boundary).or_default().push(image);
+        }
+        for (index, message) in messages
+            .into_iter()
+            .map(Some)
+            .chain(std::iter::once(None))
+            .enumerate()
+        {
+            for image in image_boundaries.remove(&index).unwrap_or_default() {
+                self.write_notification(
+                    "session/update",
+                    json!({"sessionId": session_id, "update": history_image_update(image)}),
+                )
+                .await?;
+            }
+            if let Some(message) = message {
+                for update in history_updates(message) {
+                    self.write_notification(
+                        "session/update",
+                        json!({"sessionId": session_id, "update": update}),
+                    )
+                    .await?;
+                }
+            }
         }
         Ok(())
     }
@@ -1017,12 +1281,21 @@ impl AcpRuntime {
         images: Vec<(String, String)>,
         explicit_skill: Option<String>,
     ) -> Result<()> {
-        if let Some(command) = parse_acp_slash_command(&text) {
+        let command = parse_acp_slash_command(&text);
+        let subagent_prompt = match &command {
+            Some(Ok(AcpSlashCommand::Subagent(prompt))) => Some(prompt.clone()),
+            _ => None,
+        };
+        if subagent_prompt.is_none()
+            && let Some(command) = command
+        {
             let response = match command {
-                Ok(command) => self.run_session_command(&session, command).await,
+                Ok(command) => {
+                    with_control_timeout(self.run_session_command(&session, command)).await
+                }
                 Err(err) => Err(err),
             };
-            cleanup_prompt_state(&session).await;
+
             let response = response?;
             self.write_notification(
                 "session/update",
@@ -1090,18 +1363,26 @@ impl AcpRuntime {
             *active = Some(prompt_id);
         }
 
-        let send_result = session
-            .send(&Request::Message {
+        let request = if let Some(prompt) = subagent_prompt {
+            Request::RunSubagent {
+                id: prompt_id,
+                prompt,
+                subagent_type: "general".into(),
+                model: None,
+                session_id: None,
+            }
+        } else {
+            Request::Message {
                 id: prompt_id,
                 content: text,
                 images,
                 system_reminder: None,
                 active_skill,
                 no_reply: false,
-            })
-            .await;
+            }
+        };
+        let send_result = session.send(&request).await;
         if let Err(err) = send_result {
-            cleanup_prompt_state(&session).await;
             return Err(err);
         }
 
@@ -1112,7 +1393,6 @@ impl AcpRuntime {
             let event = match session.read_event().await {
                 Ok(event) => event,
                 Err(err) => {
-                    cleanup_prompt_state(&session).await;
                     return Err(err);
                 }
             };
@@ -1127,7 +1407,6 @@ impl AcpRuntime {
                     stop_reason = "cancelled".to_string();
                 }
                 ServerEvent::Error { id, message, .. } if id == prompt_id => {
-                    cleanup_prompt_state(&session).await;
                     self.write_error_value(rpc_id, JSONRPC_SERVER_ERROR, message)
                         .await?;
                     return Ok(());
@@ -1177,6 +1456,7 @@ impl AcpRuntime {
                 ServerEvent::ModelChanged {
                     model,
                     provider_name,
+                    reasoning_effort,
                     error,
                     ..
                 } => {
@@ -1186,12 +1466,14 @@ impl AcpRuntime {
                         let config_options = {
                             let mut state = session.ui_state.lock().await;
                             state.model = Some(model);
+                            state.reasoning_effort = reasoning_effort;
                             if provider_name.is_some() {
                                 state.provider_name = provider_name;
                             }
                             session_config_options(&state)
                         };
                         if !config_options.is_empty() {
+                            self.write_current_mode_update(&session).await?;
                             self.write_notification(
                                 "session/update",
                                 json!({
@@ -1205,6 +1487,32 @@ impl AcpRuntime {
                             .await?;
                         }
                     }
+                }
+                ServerEvent::AvailableModelsUpdated {
+                    provider_name,
+                    provider_model,
+                    available_models,
+                    ..
+                } => {
+                    {
+                        let mut state = session.ui_state.lock().await;
+                        if provider_name.is_some() {
+                            state.provider_name = provider_name
+                        }
+                        if provider_model.is_some() {
+                            state.model = provider_model
+                        }
+                        state.available_models = available_models;
+                    }
+                    self.write_config_option_update(&session).await?;
+                }
+                ServerEvent::ReasoningEffortChanged {
+                    effort,
+                    error: None,
+                    ..
+                } => {
+                    session.ui_state.lock().await.reasoning_effort = effort;
+                    self.write_config_option_update(&session).await?;
                 }
                 other => {
                     for update in mapper.map_event(other) {
@@ -1221,7 +1529,6 @@ impl AcpRuntime {
             }
         }
 
-        cleanup_prompt_state(&session).await;
         self.write_result(rpc_id, prompt_response(&stop_reason, &turn_usage))
             .await?;
         Ok(())
@@ -1318,11 +1625,64 @@ impl AcpRuntime {
                     .unwrap_or(effort);
                 Ok(format!("Set reasoning effort to `{selected}`."))
             }
+            AcpSlashCommand::SubagentModel(None) => {
+                let state = session.ui_state.lock().await;
+                Ok(format!(
+                    "Subagent model: `{}`.",
+                    state.subagent_model.as_deref().unwrap_or("inherit")
+                ))
+            }
+            AcpSlashCommand::SubagentModel(Some(value)) => {
+                let model = (value != "inherit").then_some(value);
+                let id = session.next_id();
+                session
+                    .send(&Request::SetSubagentModel {
+                        id,
+                        model: model.clone(),
+                    })
+                    .await?;
+                wait_for_done(session, id).await?;
+                session.ui_state.lock().await.subagent_model = model;
+                self.write_config_option_update(session).await?;
+                Ok("Updated the session subagent model policy.".into())
+            }
+            AcpSlashCommand::ReloadSkills => {
+                let id = session.next_id();
+                session.send(&Request::ReloadSkills { id }).await?;
+                loop {
+                    match session.read_event().await? {
+                        ServerEvent::SkillsReloaded {
+                            id: event_id,
+                            skills,
+                            error,
+                        } if event_id == id => {
+                            if let Some(error) = error {
+                                anyhow::bail!(error)
+                            }
+                            return Ok(format!(
+                                "Reloaded {} skills: {}",
+                                skills.len(),
+                                skills.join(", ")
+                            ));
+                        }
+                        ServerEvent::Error {
+                            id: event_id,
+                            message,
+                            ..
+                        } if event_id == id => anyhow::bail!(message),
+                        _ => {}
+                    }
+                }
+            }
+            AcpSlashCommand::Subagent(_) => {
+                unreachable!("subagents use the normal streaming turn path")
+            }
         }
     }
 
     async fn write_config_option_update(&self, session: &DaemonSession) -> Result<()> {
         let config_options = session_config_options(&*session.ui_state.lock().await);
+        self.write_current_mode_update(session).await?;
         self.write_notification(
             "session/update",
             json!({
@@ -1334,6 +1694,13 @@ impl AcpRuntime {
             }),
         )
         .await
+    }
+
+    async fn write_current_mode_update(&self, session: &DaemonSession) -> Result<()> {
+        self.write_notification("session/update", json!({
+            "sessionId": session.session_id,
+            "update": {"sessionUpdate": "current_mode_update", "currentModeId": session_mode(&*session.ui_state.lock().await)}
+        })).await
     }
 
     async fn write_result(&self, id: Value, result: Value) -> Result<()> {
@@ -1399,6 +1766,86 @@ async fn cleanup_prompt_state(session: &DaemonSession) {
     session.prompt_running.store(false, Ordering::SeqCst);
 }
 
+fn list_params(params: &Value) -> std::result::Result<(Option<String>, Option<String>), String> {
+    let optional_string = |field: &str| match params.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) if !value.is_empty() => Ok(Some(value.clone())),
+        _ => Err(format!("session/list {field} must be a non-empty string")),
+    };
+    let cwd = optional_string("cwd")?;
+    if cwd
+        .as_deref()
+        .is_some_and(|cwd| !std::path::Path::new(cwd).is_absolute())
+    {
+        return Err("session/list cwd must be absolute".into());
+    }
+    let cursor = optional_string("cursor")?;
+    if let Some(cursor) = &cursor {
+        serde_json::from_str::<(String, String)>(cursor)
+            .map_err(|_| "Invalid session/list cursor".to_string())?;
+    }
+    Ok((cwd, cursor))
+}
+
+fn session_list_page(mut sessions: Vec<Value>, cursor: Option<&str>) -> Value {
+    const PAGE_SIZE: usize = 50;
+    sessions.sort_by(|a, b| {
+        b["updatedAt"]
+            .as_str()
+            .cmp(&a["updatedAt"].as_str())
+            .then_with(|| a["sessionId"].as_str().cmp(&b["sessionId"].as_str()))
+    });
+    if let Some((updated_at, session_id)) =
+        cursor.and_then(|cursor| serde_json::from_str::<(String, String)>(cursor).ok())
+    {
+        sessions.retain(|session| {
+            let updated = session["updatedAt"].as_str().unwrap_or_default();
+            updated < updated_at.as_str()
+                || (updated == updated_at
+                    && session["sessionId"].as_str().unwrap_or_default() > session_id.as_str())
+        });
+    }
+    let more = sessions.len() > PAGE_SIZE;
+    sessions.truncate(PAGE_SIZE);
+    let next_cursor = more.then(|| {
+        let last = sessions.last().expect("a full page");
+        serde_json::to_string(&(last["updatedAt"].as_str(), last["sessionId"].as_str()))
+            .expect("string cursor")
+    });
+    let mut result = json!({"sessions": sessions});
+    if let Some(cursor) = next_cursor {
+        result["nextCursor"] = json!(cursor);
+    }
+    result
+}
+
+fn history_updates(message: crate::protocol::HistoryMessage) -> Vec<Value> {
+    match message.role.as_str() {
+        "user" | "assistant" => vec![json!({
+            "sessionUpdate": if message.role == "user" { "user_message_chunk" } else { "agent_message_chunk" },
+            "content": {"type": "text", "text": message.content},
+        })],
+        "tool" => message.tool_data.map(|tool| vec![json!({
+            "sessionUpdate": "tool_call",
+            "toolCallId": tool.id,
+            "title": tool.intent.as_deref().unwrap_or(&tool.name),
+            "kind": tool_kind(&tool.name),
+            "status": "completed",
+            "rawInput": tool.input,
+            "content": [{"type": "content", "content": {"type": "text", "text": message.content}}],
+        })]).unwrap_or_default(),
+        // Never present hidden system context or an unknown role as assistant speech.
+        _ => Vec::new(),
+    }
+}
+
+fn history_image_update(image: crate::session::RenderedImage) -> Value {
+    json!({
+        "sessionUpdate": if matches!(image.source, crate::session::RenderedImageSource::UserInput) { "user_message_chunk" } else { "agent_message_chunk" },
+        "content": {"type": "image", "mimeType": image.media_type, "data": image.data},
+    })
+}
+
 async fn wait_for_done(session: &DaemonSession, request_id: u64) -> Result<()> {
     loop {
         match session.read_event().await? {
@@ -1453,8 +1900,6 @@ async fn request_model_catalog(session: &DaemonSession) -> Result<ServerEvent> {
     }
 }
 
-mod session_configuration;
-use session_configuration::*;
 
 async fn wait_for_model_changed(session: &DaemonSession, request_id: u64) -> Result<()> {
     loop {
@@ -1464,6 +1909,7 @@ async fn wait_for_model_changed(session: &DaemonSession, request_id: u64) -> Res
                 id,
                 model,
                 provider_name,
+                reasoning_effort,
                 error,
                 ..
             } if id == request_id => {
@@ -1472,6 +1918,7 @@ async fn wait_for_model_changed(session: &DaemonSession, request_id: u64) -> Res
                 }
                 let mut state = session.ui_state.lock().await;
                 state.model = Some(model);
+                state.reasoning_effort = reasoning_effort;
                 if provider_name.is_some() {
                     state.provider_name = provider_name;
                 }
@@ -1510,6 +1957,7 @@ struct EventMapper {
     profile: AcpProfile,
     current_tool_id: Option<String>,
     tool_inputs: HashMap<String, String>,
+    worker_status: HashMap<String, String>,
 }
 
 impl EventMapper {
@@ -1519,12 +1967,53 @@ impl EventMapper {
             profile,
             current_tool_id: None,
             tool_inputs: HashMap::new(),
+            worker_status: HashMap::new(),
         }
     }
 
     fn map_event(&mut self, event: ServerEvent) -> Vec<Value> {
         match event {
             ServerEvent::TextDelta { text } => vec![agent_message_chunk(text)],
+            ServerEvent::ReasoningDelta { text } => vec![
+                json!({"sessionUpdate": "agent_thought_chunk", "content": {"type": "text", "text": text}}),
+            ],
+            ServerEvent::SwarmStatus { members } => {
+                let mut updates = Vec::new();
+                for member in members {
+                    if member.report_back_to_session_id.as_deref() != Some(&self.session_id) {
+                        continue;
+                    }
+                    let id = format!("swarm/{}", member.session_id);
+                    let status = match member.status.as_str() {
+                        "completed" => "completed",
+                        "ready" | "idle" => "pending",
+                        "failed" | "stopped" | "error" => "failed",
+                        _ => "in_progress",
+                    };
+                    let text = member
+                        .output_tail
+                        .as_deref()
+                        .or(member.detail.as_deref())
+                        .unwrap_or(&member.status);
+                    let signature = format!("{status}:{text}");
+                    if self.worker_status.get(&id) == Some(&signature) {
+                        continue;
+                    }
+                    let update_type = if self.worker_status.insert(id.clone(), signature).is_some()
+                    {
+                        "tool_call_update"
+                    } else {
+                        "tool_call"
+                    };
+                    updates.push(json!({
+                        "sessionUpdate": update_type, "toolCallId": id, "kind": "other", "status": status,
+                        "title": format!("Subagent: {}", member.task_label.as_deref().or(member.friendly_name.as_deref()).unwrap_or(&member.session_id)),
+                        "content": [{"type": "content", "content": {"type": "text", "text": text}}],
+                        "_meta": {"jcode": {"sessionId": member.session_id, "parentSessionId": member.report_back_to_session_id}},
+                    }));
+                }
+                updates
+            }
             ServerEvent::TextReplace { text } => vec![agent_message_chunk(text)],
             // ACP chunks cannot retract prior output. Surface the corrected
             // source links rather than silently discarding provider metadata.
@@ -1542,8 +2031,8 @@ impl EventMapper {
                     "status": "pending",
                 })]
             }
-            ServerEvent::ToolInput { delta, .. } => {
-                let Some(tool_id) = self.current_tool_id.clone() else {
+            ServerEvent::ToolInput { id, delta } => {
+                let Some(tool_id) = id.or_else(|| self.current_tool_id.clone()) else {
                     return Vec::new();
                 };
                 let buffer = self.tool_inputs.entry(tool_id.clone()).or_default();
@@ -1694,6 +2183,7 @@ fn initialize_result(params: &Value, profile: AcpProfile) -> Value {
             "sse": false,
         },
         "sessionCapabilities": {
+            "list": {},
             "close": {},
             "resume": {},
         }
@@ -1823,6 +2313,9 @@ enum AcpSlashCommand {
     Model(Option<String>),
     Models,
     Effort(Option<String>),
+    Subagent(String),
+    SubagentModel(Option<String>),
+    ReloadSkills,
 }
 
 fn parse_acp_slash_command(text: &str) -> Option<Result<AcpSlashCommand>> {
@@ -1842,6 +2335,16 @@ fn parse_acp_slash_command(text: &str) -> Option<Result<AcpSlashCommand>> {
         "models" if argument.is_none() => Some(Ok(AcpSlashCommand::Models)),
         "models" => Some(Err(anyhow::anyhow!("/models does not accept an argument"))),
         "effort" => Some(Ok(AcpSlashCommand::Effort(argument))),
+        "subagent-model" => Some(Ok(AcpSlashCommand::SubagentModel(argument))),
+        "subagent" => Some(
+            argument
+                .map(AcpSlashCommand::Subagent)
+                .ok_or_else(|| anyhow::anyhow!("/subagent requires a prompt")),
+        ),
+        "skills" if argument.as_deref() == Some("reload") => {
+            Some(Ok(AcpSlashCommand::ReloadSkills))
+        }
+        "skills" => Some(Err(anyhow::anyhow!("ACP supports /skills reload"))),
         _ => None,
     }
 }
@@ -1991,4 +2494,434 @@ pub(crate) async fn run_acp_command(
 }
 
 #[cfg(test)]
-mod tests;
+#[path = "acp_protocol_tests.rs"]
+mod protocol_tests;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn acp_tool_kind_maps_core_tools() {
+        assert_eq!(tool_kind("read"), "read");
+        assert_eq!(tool_kind("apply_patch"), "edit");
+        assert_eq!(tool_kind("bash"), "execute");
+        assert_eq!(tool_kind("agentgrep"), "search");
+        assert_eq!(tool_kind("webfetch"), "fetch");
+        assert_eq!(tool_kind("swarm"), "other");
+    }
+
+    #[test]
+    fn json_rpc_parse_errors_use_standard_codes() {
+        let (code, _) = JsonRpcMessage::parse("not json").unwrap_err();
+        assert_eq!(code, JSONRPC_PARSE_ERROR);
+
+        let (code, message) = JsonRpcMessage::parse(r#"{"method":"initialize"}"#).unwrap_err();
+        assert_eq!(code, JSONRPC_INVALID_REQUEST);
+        assert!(message.contains("jsonrpc"));
+    }
+
+    #[test]
+    fn prompt_from_params_accepts_text_images_and_resources() {
+        let params = json!({
+            "sessionId": "s1",
+            "prompt": [
+                {"type": "text", "text": "hello"},
+                {"type": "image", "mimeType": "image/png", "data": "abc"},
+                {"type": "resource", "resource": {"uri": "file:///tmp/a.rs", "text": "fn main(){}"}},
+                {"type": "resource_link", "uri": "file:///tmp/b.rs", "name": "b.rs"}
+            ]
+        });
+        let (text, images) = prompt_from_params(&params).unwrap();
+        assert!(text.contains("hello"));
+        assert!(text.contains("Embedded resource: file:///tmp/a.rs"));
+        assert!(text.contains("Resource link: b.rs"));
+        assert_eq!(images, vec![("image/png".to_string(), "abc".to_string())]);
+    }
+
+    #[test]
+    fn prompt_usage_deduplicates_live_snapshots_and_resets_per_call() {
+        let mut usage = TurnUsage::default();
+        usage.observe_snapshot(10, 2, Some(4), None);
+        usage.observe_snapshot(10, 3, Some(4), Some(5));
+        usage.observe_snapshot(10, 3, Some(4), Some(5));
+        // Stale or partial snapshots must not lower the per-call watermark.
+        usage.observe_snapshot(8, 1, Some(2), None);
+        usage.observe_snapshot(10, 3, Some(4), Some(5));
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.output_tokens, 3);
+        assert_eq!(usage.cached_read_tokens, Some(4));
+        assert_eq!(usage.cached_write_tokens, Some(5));
+        usage.begin_call();
+        usage.observe_snapshot(20, 3, Some(6), Some(7));
+        assert_eq!(usage.input_tokens, 30);
+        assert_eq!(usage.output_tokens, 6);
+        assert_eq!(usage.cached_read_tokens, Some(10));
+        assert_eq!(usage.cached_write_tokens, Some(12));
+    }
+
+    #[test]
+    fn prompt_response_reports_usage_accumulated_across_the_turn() {
+        let mut usage = TurnUsage::default();
+        usage.add(10, 2, Some(4), Some(5));
+        usage.add(20, 3, Some(6), Some(7));
+
+        assert_eq!(
+            prompt_response("end_turn", &usage),
+            json!({
+                "stopReason": "end_turn",
+                "usage": {
+                    "totalTokens": 57,
+                    "inputTokens": 30,
+                    "outputTokens": 5,
+                    "cachedReadTokens": 10,
+                    "cachedWriteTokens": 12,
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn prompt_response_omits_unreported_usage_and_cache_fields() {
+        assert_eq!(
+            prompt_response("end_turn", &TurnUsage::default()),
+            json!({ "stopReason": "end_turn" })
+        );
+
+        let mut usage = TurnUsage::default();
+        usage.add(10, 2, None, None);
+        assert_eq!(
+            prompt_response("cancelled", &usage),
+            json!({
+                "stopReason": "cancelled",
+                "usage": {
+                    "totalTokens": 12,
+                    "inputTokens": 10,
+                    "outputTokens": 2,
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn initialize_standard_omits_jcode_meta() {
+        let result = initialize_result(&json!({"protocolVersion": 1}), AcpProfile::Standard);
+        assert_eq!(result["protocolVersion"], 1);
+        assert!(result["agentCapabilities"].get("_meta").is_none());
+        assert_eq!(result["agentCapabilities"]["loadSession"], true);
+    }
+
+    #[test]
+    fn initialize_full_advertises_jcode_extension_meta() {
+        let result = initialize_result(&json!({"protocolVersion": 1}), AcpProfile::Full);
+        assert_eq!(
+            result["agentCapabilities"]["_meta"]["jcode"]["profile"],
+            "full"
+        );
+    }
+
+    #[test]
+    fn event_mapper_maps_tool_lifecycle() {
+        let mut mapper = EventMapper::new("session1".to_string(), AcpProfile::Standard);
+        let start = mapper.map_event(ServerEvent::ToolStart {
+            id: "tool1".to_string(),
+            name: "bash".to_string(),
+        });
+        assert_eq!(start[0]["sessionUpdate"], "tool_call");
+        assert_eq!(start[0]["kind"], "execute");
+
+        let input = mapper.map_event(ServerEvent::ToolInput {
+            id: None,
+            delta: "{\"command\":\"true\"}".to_string(),
+        });
+        assert_eq!(input[0]["rawInput"]["command"], "true");
+
+        let done = mapper.map_event(ServerEvent::ToolDone {
+            id: "tool1".to_string(),
+            name: "bash".to_string(),
+            output: "ok".to_string(),
+            error: None,
+        });
+        assert_eq!(done[0]["status"], "completed");
+        assert_eq!(done[0]["content"][0]["content"]["text"], "ok");
+    }
+
+    #[test]
+    fn non_empty_mcp_servers_are_tolerated_until_session_scoped_mcp_is_supported() {
+        let params = json!({"mcpServers": [{"name": "fs"}]});
+        assert!(validate_acp_mcp_servers(&params).is_ok());
+
+        let params = json!({"mcpServers": []});
+        assert!(validate_acp_mcp_servers(&params).is_ok());
+    }
+
+    #[test]
+    fn advertised_commands_cover_all_acp_daemon_model_controls() {
+        let commands = acp_available_commands();
+        let names: Vec<&str> = commands
+            .iter()
+            .map(|command| command["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "model",
+                "models",
+                "effort",
+                "subagent",
+                "subagent-model",
+                "skills"
+            ]
+        );
+        assert_eq!(commands[0]["input"]["hint"], "model id (optional)");
+        assert!(commands[1].get("input").is_none());
+        assert!(
+            commands[2]["input"]["hint"]
+                .as_str()
+                .unwrap()
+                .contains("high")
+        );
+    }
+
+    #[test]
+    fn advertised_commands_parse_to_real_dispatch_variants() {
+        assert_eq!(
+            parse_acp_slash_command("/model claude-sonnet-4-5")
+                .unwrap()
+                .unwrap(),
+            AcpSlashCommand::Model(Some("claude-sonnet-4-5".to_string()))
+        );
+        assert_eq!(
+            parse_acp_slash_command("/model ").unwrap().unwrap(),
+            AcpSlashCommand::Model(None)
+        );
+        assert_eq!(
+            parse_acp_slash_command("/models").unwrap().unwrap(),
+            AcpSlashCommand::Models
+        );
+        assert_eq!(
+            parse_acp_slash_command("/effort xhigh").unwrap().unwrap(),
+            AcpSlashCommand::Effort(Some("xhigh".to_string()))
+        );
+        assert!(parse_acp_slash_command("/models now").unwrap().is_err());
+        assert!(parse_acp_slash_command("/not-advertised").is_none());
+        assert!(parse_acp_slash_command(" /model literal").is_none());
+        assert!(parse_acp_slash_command("ordinary prompt").is_none());
+    }
+
+    fn project_skills(names: &[&str]) -> (tempfile::TempDir, crate::skill::SkillRegistry) {
+        let dir = tempfile::tempdir().unwrap();
+        for name in names {
+            let skill_dir = dir.path().join(".jcode/skills").join(name);
+            std::fs::create_dir_all(&skill_dir).unwrap();
+            std::fs::write(
+                skill_dir.join("SKILL.md"),
+                format!("---\nname: {name}\ndescription: Test {name}\n---\nDo {name}.\n"),
+            )
+            .unwrap();
+        }
+        let registry = crate::skill::SkillRegistry::load_project_overlay(Some(dir.path())).unwrap();
+        (dir, registry)
+    }
+
+    #[test]
+    fn slash_and_dollar_skill_invocations_resolve_with_trailing_prompt() {
+        let (_dir, skills) = project_skills(&["interrogate"]);
+        assert_eq!(
+            resolve_acp_skill_invocation(&skills, "/interrogate"),
+            Some(("interrogate".to_string(), None))
+        );
+        assert_eq!(
+            resolve_acp_skill_invocation(&skills, "/interrogate the auth flow\n"),
+            Some(("interrogate".to_string(), Some("the auth flow".to_string())))
+        );
+        assert_eq!(
+            resolve_acp_skill_invocation(&skills, "$interrogate why"),
+            Some(("interrogate".to_string(), Some("why".to_string())))
+        );
+    }
+
+    #[test]
+    fn unknown_escaped_and_path_like_slash_text_is_untouched() {
+        let (_dir, skills) = project_skills(&["interrogate"]);
+        for text in [
+            "/unknown do things",
+            "/home/user/file.rs explain",
+            " /interrogate escaped",
+            "please /interrogate",
+            "$HOME is set",
+            "ordinary prompt",
+        ] {
+            assert_eq!(resolve_acp_skill_invocation(&skills, text), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn explicit_skill_metadata_is_read_from_prompt_meta() {
+        assert_eq!(
+            explicit_skill_from_params(&json!({"_meta": {"jcode": {"skill": "/interrogate"}}})),
+            Some("interrogate".to_string())
+        );
+        assert_eq!(
+            explicit_skill_from_params(&json!({"_meta": {"activeSkill": "$review"}})),
+            Some("review".to_string())
+        );
+        assert_eq!(
+            explicit_skill_from_params(&json!({"_meta": {"skill": " "}})),
+            None
+        );
+        assert_eq!(explicit_skill_from_params(&json!({})), None);
+    }
+
+    #[test]
+    fn skill_commands_advertise_installed_skills_without_shadowing_builtins() {
+        let (_dir, skills) = project_skills(&["interrogate", "model"]);
+        let commands = acp_skill_commands(&skills);
+        let names: Vec<&str> = commands
+            .iter()
+            .map(|command| command["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, ["interrogate"]);
+        assert_eq!(commands[0]["description"], "Test interrogate");
+    }
+
+    #[test]
+    fn compatibility_methods_accept_host_field_names_and_aliases() {
+        assert_eq!(
+            compatibility_option_value(
+                &json!({"modelId": "deepseek-v4-flash"}),
+                &["modelId", "model"],
+                "session/set_model"
+            )
+            .unwrap(),
+            "deepseek-v4-flash"
+        );
+        assert_eq!(
+            compatibility_option_value(
+                &json!({"reasoningEffort": "high"}),
+                &["effort", "reasoningEffort"],
+                "session/set_reasoning_effort"
+            )
+            .unwrap(),
+            "high"
+        );
+        assert!(
+            compatibility_option_value(
+                &json!({"effort": ""}),
+                &["effort", "reasoningEffort"],
+                "session/set_reasoning_effort"
+            )
+            .unwrap_err()
+            .contains("non-empty")
+        );
+    }
+
+    #[test]
+    fn cwd_must_be_absolute() {
+        let params = json!({"cwd": "relative"});
+        assert!(cwd_from_params(&params).is_err());
+        let params = json!({"cwd": "/tmp"});
+        assert_eq!(cwd_from_params(&params).unwrap(), Path::new("/tmp"));
+    }
+
+    #[test]
+    fn config_options_include_model_selector_and_effort_ladder() {
+        let state = SessionUiState {
+            provider_name: Some("openai".to_string()),
+            model: Some("gpt-5.2".to_string()),
+            available_models: vec!["gpt-5.2".to_string(), "gpt-5.2-codex".to_string()],
+            reasoning_effort: Some("high".to_string()),
+            ..SessionUiState::default()
+        };
+        let options = session_config_options(&state);
+        assert_eq!(options.len(), 5);
+
+        let model = &options[0];
+        assert_eq!(model["id"], CONFIG_ID_MODEL);
+        assert_eq!(model["category"], "model");
+        assert_eq!(model["type"], "select");
+        assert_eq!(model["currentValue"], "gpt-5.2");
+        assert_eq!(model["options"].as_array().unwrap().len(), 2);
+
+        let effort = options
+            .iter()
+            .find(|option| option["id"] == CONFIG_ID_EFFORT)
+            .unwrap();
+        assert_eq!(effort["id"], CONFIG_ID_EFFORT);
+        assert_eq!(effort["category"], "thought_level");
+        assert_eq!(effort["currentValue"], "high");
+        let effort_values: Vec<&str> = effort["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|option| option["value"].as_str().unwrap())
+            .collect();
+        assert!(effort_values.contains(&"medium"));
+        assert!(effort_values.contains(&"swarm"));
+    }
+
+    #[test]
+    fn config_options_current_model_prepended_when_not_listed() {
+        let state = SessionUiState {
+            provider_name: Some("anthropic".to_string()),
+            model: Some("claude-opus-4-6".to_string()),
+            available_models: vec!["claude-sonnet-4-5".to_string()],
+            reasoning_effort: None,
+            ..SessionUiState::default()
+        };
+        let options = session_config_options(&state);
+        let model_values: Vec<&str> = options[0]["options"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|option| option["value"].as_str().unwrap())
+            .collect();
+        assert_eq!(model_values[0], "claude-opus-4-6");
+        assert!(model_values.contains(&"claude-sonnet-4-5"));
+    }
+
+    #[test]
+    fn legacy_models_catalog_is_emitted_alongside_config_options() {
+        let state = SessionUiState {
+            provider_name: Some("deepseek".to_string()),
+            model: Some("deepseek-v4-flash".to_string()),
+            available_models: vec!["deepseek-v4-pro".to_string()],
+            reasoning_effort: Some("high".to_string()),
+            ..SessionUiState::default()
+        };
+        let mut result = json!({"sessionId": "s1"});
+        insert_session_configuration(&mut result, &state);
+
+        assert!(result["configOptions"].is_array());
+        assert_eq!(result["models"]["currentModelId"], "deepseek-v4-flash");
+        let ids: Vec<&str> = result["models"]["availableModels"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|model| model["modelId"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["deepseek-v4-flash", "deepseek-v4-pro"]);
+    }
+
+    #[test]
+    fn config_options_empty_without_model_state() {
+        let options = session_config_options(&SessionUiState::default());
+        assert!(options.is_empty());
+    }
+
+    #[test]
+    fn context_limit_falls_back_to_default_for_unknown_models() {
+        let state = SessionUiState {
+            provider_name: Some("mystery".to_string()),
+            model: Some("mystery-model-9000".to_string()),
+            available_models: Vec::new(),
+            reasoning_effort: None,
+            ..SessionUiState::default()
+        };
+        assert_eq!(
+            state.context_limit(),
+            crate::provider::DEFAULT_CONTEXT_LIMIT as u64
+        );
+    }
+}
