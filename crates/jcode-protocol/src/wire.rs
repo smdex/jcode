@@ -212,6 +212,10 @@ pub enum Request {
     #[serde(rename = "get_history")]
     GetHistory { id: u64 },
 
+    /// Reload server-owned skills without starting a model turn.
+    #[serde(rename = "reload_skills")]
+    ReloadSkills { id: u64 },
+
     /// Get only provider/model metadata and available models.
     #[serde(rename = "get_model_catalog")]
     GetModelCatalog {
