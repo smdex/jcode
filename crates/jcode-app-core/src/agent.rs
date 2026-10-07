@@ -789,12 +789,8 @@ impl Agent {
             // The client can discover an installation after the daemon started.
             // Refresh server-owned globals, never trust client-provided content
             // or put this session's project overlay into the shared registry.
-            match SkillRegistry::load_global() {
-                Ok(global) => {
-                    self.skills = Arc::new(global.clone());
-                    *self.registry.skills().write().await = global;
-                    skills = self.current_skills_snapshot();
-                }
+            match self.reload_skills().await {
+                Ok(_) => skills = self.current_skills_snapshot(),
                 Err(error) => logging::warn(&format!("Failed to refresh skills: {error}")),
             }
         }
@@ -803,6 +799,13 @@ impl Agent {
             .is_none_or(|name| skills.get(name).is_some());
         self.active_skill = active_skill.filter(|name| skills.get(name).is_some());
         recognized
+    }
+
+    pub(super) async fn reload_skills(&mut self) -> Result<Vec<String>> {
+        let global = SkillRegistry::load_global()?;
+        self.skills = Arc::new(global.clone());
+        *self.registry.skills().write().await = global;
+        Ok(self.available_skill_names())
     }
 
     fn sync_session_compaction_state_from_manager(

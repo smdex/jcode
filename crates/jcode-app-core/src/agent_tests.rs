@@ -77,6 +77,40 @@ async fn remote_active_skill_refreshes_late_global_installation() {
     );
     assert!(agent.active_skill.is_none());
     assert!(agent.set_remote_active_skill(None).await);
+    let message_count = agent.message_count();
+    std::fs::write(
+        dir.join("SKILL.md"),
+        format!("---\nname: {name}\ndescription: Updated skill\n---\n\nUpdated instructions."),
+    )
+    .unwrap();
+    assert!(
+        agent
+            .reload_skills()
+            .await
+            .unwrap()
+            .contains(&name.to_string())
+    );
+    assert!(
+        agent
+            .current_skills_snapshot()
+            .get(name)
+            .unwrap()
+            .get_prompt()
+            .contains("Updated instructions")
+    );
+    std::fs::remove_file(dir.join("SKILL.md")).unwrap();
+    assert!(
+        !agent
+            .reload_skills()
+            .await
+            .unwrap()
+            .contains(&name.to_string())
+    );
+    assert_eq!(
+        agent.message_count(),
+        message_count,
+        "reload must not create a model turn"
+    );
 }
 
 struct NativeCompactionStreamProvider;

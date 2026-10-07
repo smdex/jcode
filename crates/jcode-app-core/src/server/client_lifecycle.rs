@@ -1831,6 +1831,15 @@ pub(super) async fn handle_client(
                 provisional_session = false;
             }
 
+            Request::ReloadSkills { id } => {
+                let result = agent.lock().await.reload_skills().await;
+                let (skills, error) = match result {
+                    Ok(skills) => (skills, None),
+                    Err(error) => (Vec::new(), Some(error.to_string())),
+                };
+                let _ = client_event_tx.send(ServerEvent::SkillsReloaded { id, skills, error });
+            }
+
             Request::GetHistory { id } => {
                 if handle_get_history(
                     id,

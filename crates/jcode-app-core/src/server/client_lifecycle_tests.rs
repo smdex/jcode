@@ -2091,6 +2091,61 @@ async fn system_prompt_socket_creation_attach_resume_fork_and_no_leaking() {
         assert_eq!(saved.system_prompt.as_deref(), Some(prompt));
         assert_eq!(saved.visible_conversation_message_count(), 0);
 
+        // Reload is a control request: late installs and removals update the
+        // daemon snapshot without adding history or invoking the provider.
+        let skill_name = "socket-reload-regression";
+        let skill_dir = home._home.path().join("skills").join(skill_name);
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            format!(
+                "---\nname: {skill_name}\ndescription: Socket reload test\n---\n\nReloaded prompt."
+            ),
+        )
+        .unwrap();
+        let generations_before = captured.lock().unwrap().len();
+        let parent = sessions.read().await.get(&parent_id).unwrap().clone();
+        let messages_before = parent.lock().await.message_count();
+        send(
+            &mut owner_writer,
+            serde_json::to_value(Request::ReloadSkills { id: 120 }).unwrap(),
+        )
+        .await;
+        let ServerEvent::SkillsReloaded { skills, error, .. } = until(&mut owner_reader, |e| {
+            matches!(e, ServerEvent::SkillsReloaded { id: 120, .. })
+        })
+        .await
+        else {
+            unreachable!()
+        };
+        assert!(error.is_none(), "{error:?}");
+        assert!(skills.contains(&skill_name.to_string()));
+        assert!(
+            parent
+                .lock()
+                .await
+                .available_skill_names()
+                .contains(&skill_name.to_string())
+        );
+        assert_eq!(parent.lock().await.message_count(), messages_before);
+        assert_eq!(captured.lock().unwrap().len(), generations_before);
+        std::fs::remove_file(skill_dir.join("SKILL.md")).unwrap();
+        send(
+            &mut owner_writer,
+            serde_json::to_value(Request::ReloadSkills { id: 121 }).unwrap(),
+        )
+        .await;
+        let ServerEvent::SkillsReloaded { skills, error, .. } = until(&mut owner_reader, |e| {
+            matches!(e, ServerEvent::SkillsReloaded { id: 121, .. })
+        })
+        .await
+        else {
+            unreachable!()
+        };
+        assert!(error.is_none());
+        assert!(!skills.contains(&skill_name.to_string()));
+        assert_eq!(captured.lock().unwrap().len(), generations_before);
+
         // Repeated Subscribe cannot mutate even the current owner's prompt.
         send(
             &mut owner_writer,
