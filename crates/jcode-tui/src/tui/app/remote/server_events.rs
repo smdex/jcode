@@ -2950,6 +2950,33 @@ pub(in crate::tui::app) fn handle_server_event(
             }
             false
         }
+        ServerEvent::SkillsReloaded { skills, error, .. } => {
+            if let Some(error) = error {
+                app.push_display_message(DisplayMessage::error(format!(
+                    "Failed to reload skills: {error}"
+                )));
+                app.set_status_notice("Skill reload failed");
+            } else {
+                let count = skills.len();
+                app.remote_skills = skills;
+                if app
+                    .active_skill
+                    .as_ref()
+                    .is_some_and(|name| !app.remote_skills.contains(name))
+                {
+                    app.active_skill = None;
+                }
+                let _ = app.refresh_skills_snapshot();
+                app.invalidate_command_candidates_cache();
+                crate::tui::ui::prepare::invalidate_header_prep_cache();
+                app.push_display_message(
+                    DisplayMessage::system(format!("Reloaded {count} skills from disk."))
+                        .with_title("Skills"),
+                );
+                app.set_status_notice(format!("Reloaded {count} skills"));
+            }
+            false
+        }
         ServerEvent::ResumeAllResult {
             resumed, message, ..
         } => {

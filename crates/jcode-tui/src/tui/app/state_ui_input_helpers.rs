@@ -152,8 +152,9 @@ const REGISTERED_COMMANDS: &[RegisteredCommand] = &[
     RegisteredCommand::public("/context", "Show the full session context snapshot"),
     RegisteredCommand::public(
         "/skills",
-        "Show loaded skills and jcode-endorsed recommendations",
+        "Show skills (/skills reload to reload from disk)",
     ),
+    RegisteredCommand::public("/reload-skills", "Reload installed skills from disk"),
     RegisteredCommand::public("/version", "Show current version"),
     RegisteredCommand::public("/changelog", "Show recent changes in this build"),
     RegisteredCommand::public("/info", "Show session info and tokens"),

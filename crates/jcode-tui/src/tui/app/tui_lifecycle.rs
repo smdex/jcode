@@ -1397,7 +1397,7 @@ impl App {
         // Minimal local clients start with empty skill registries. Load global
         // metadata once so autocomplete works before the first History event.
         // SSH clients above must use only the remote server's skill metadata.
-        app.refresh_skills_snapshot();
+        let _ = app.refresh_skills_snapshot();
         app.apply_remote_header_hint();
         // Start the background git probe now so the git widgets are ready by
         // the first frame or two instead of popping in later.

@@ -14,6 +14,96 @@ use std::sync::Arc;
 
 struct MockProvider;
 
+#[test]
+fn skill_reload_commands_send_control_request_and_refresh_autocomplete() {
+    use crossterm::event::{KeyCode, KeyModifiers};
+    use tokio::io::AsyncBufReadExt;
+    let _lock = crate::storage::lock_test_env();
+    let mut app = create_test_app();
+    app.is_remote = true;
+    app.remote_skills = vec!["old-remote-reload-skill".into()];
+    app.active_skill = Some("old-remote-reload-skill".into());
+    let _ = app.get_suggestions_for("/old-remote-reload");
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let mut remote = crate::tui::backend::RemoteConnection::dummy();
+        remote.mark_history_loaded();
+        let peer = remote.take_dummy_peer().unwrap();
+        let mut reader = tokio::io::BufReader::new(peer);
+        for command in ["/skills reload", "/reload-skills"] {
+            app.input = command.into();
+            app.cursor_pos = app.input.len();
+            super::handle_remote_key(&mut app, KeyCode::Enter, KeyModifiers::NONE, &mut remote)
+                .await
+                .unwrap();
+            let mut line = String::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                reader.read_line(&mut line),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let request: crate::protocol::Request = serde_json::from_str(&line).unwrap();
+            assert!(
+                matches!(request, crate::protocol::Request::ReloadSkills { .. }),
+                "{request:?}"
+            );
+            assert!(!app.is_processing, "reload must not start a model turn");
+            handle_server_event(
+                &mut app,
+                ServerEvent::SkillsReloaded {
+                    id: request.id(),
+                    skills: vec!["new-remote-reload-skill".into()],
+                    error: None,
+                },
+                &mut remote,
+            );
+            assert!(
+                app.active_skill.is_none(),
+                "deleted skills must be deselected"
+            );
+            assert!(
+                app.get_suggestions_for("/new-remote-reload")
+                    .iter()
+                    .any(|(name, _)| name == "/new-remote-reload-skill")
+            );
+            assert!(
+                !app.get_suggestions_for("/old-remote-reload")
+                    .iter()
+                    .any(|(name, _)| name == "/old-remote-reload-skill")
+            );
+            assert!(
+                app.display_messages()
+                    .last()
+                    .unwrap()
+                    .content
+                    .contains("Reloaded 1 skills")
+            );
+        }
+        handle_server_event(
+            &mut app,
+            ServerEvent::SkillsReloaded {
+                id: 99,
+                skills: Vec::new(),
+                error: Some("disk unavailable".into()),
+            },
+            &mut remote,
+        );
+        assert_eq!(
+            app.remote_skills,
+            vec!["new-remote-reload-skill".to_string()]
+        );
+        assert!(
+            app.display_messages()
+                .last()
+                .unwrap()
+                .content
+                .contains("disk unavailable")
+        );
+    });
+}
+
 #[async_trait::async_trait]
 impl Provider for MockProvider {
     async fn complete(

@@ -197,6 +197,10 @@ pub enum Request {
     #[serde(rename = "get_history")]
     GetHistory { id: u64 },
 
+    /// Reload server-owned skills without starting a model turn.
+    #[serde(rename = "reload_skills")]
+    ReloadSkills { id: u64 },
+
     /// Get only provider/model metadata and available models.
     #[serde(rename = "get_model_catalog")]
     GetModelCatalog {
@@ -1240,6 +1244,14 @@ pub enum ServerEvent {
     /// Response for debug command
     #[serde(rename = "debug_response")]
     DebugResponse { id: u64, ok: bool, output: String },
+
+    #[serde(rename = "skills_reloaded")]
+    SkillsReloaded {
+        id: u64,
+        skills: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
 
     /// MCP status update (sent after background MCP connections complete)
     #[serde(rename = "mcp_status")]
