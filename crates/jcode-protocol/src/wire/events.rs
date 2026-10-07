@@ -531,6 +531,15 @@ pub enum ServerEvent {
     #[serde(rename = "debug_response")]
     DebugResponse { id: u64, ok: bool, output: String },
 
+    /// Skills registry reloaded; skills lists the refreshed skill names.
+    #[serde(rename = "skills_reloaded")]
+    SkillsReloaded {
+        id: u64,
+        skills: Vec<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+
     /// MCP status update (sent after background MCP connections complete)
     #[serde(rename = "mcp_status")]
     McpStatus {
