@@ -440,6 +440,14 @@ pub trait TuiState {
     // ---- Input ----
     fn input(&self) -> &str;
     fn cursor_pos(&self) -> usize;
+    /// Explicit composer scroll (first visible wrapped input row) armed while
+    /// drag-selecting in the composer, so mouse edge auto-scroll can reveal
+    /// lines outside the caret-follow view. `None` (the default) means the
+    /// composer follows the caret. Read by the composer render and by the
+    /// click-to-caret mapping so both agree on which input rows are visible.
+    fn input_copy_scroll_override(&self) -> Option<usize> {
+        None
+    }
     fn is_processing(&self) -> bool;
     fn queued_messages(&self) -> &[String];
     fn interleave_message(&self) -> Option<&str>;

@@ -2152,11 +2152,6 @@ pub(crate) fn copy_pane_vertical_edge_point(
     column: u16,
     row: u16,
 ) -> Option<(crate::tui::CopySelectionPoint, bool)> {
-    // The prompt composer cannot be wheel-scrolled, so it has no browser-style
-    // edge auto-scroll. Drags past its edge clamp via `copy_pane_drag_point`.
-    if pane == crate::tui::CopySelectionPane::Input {
-        return None;
-    }
     let snapshot = copy_snapshot_for_pane(pane)?;
     let area = snapshot.content_area;
     if area.width == 0 || area.height == 0 {
@@ -2341,6 +2336,11 @@ pub(crate) fn input_pane_line_count() -> Option<usize> {
 
 pub(crate) fn copy_viewport_visible_range() -> Option<(usize, usize)> {
     let snapshot = copy_snapshot_for_pane(crate::tui::CopySelectionPane::Chat)?;
+    Some((snapshot.scroll, snapshot.visible_end))
+}
+
+pub(crate) fn input_pane_visible_range() -> Option<(usize, usize)> {
+    let snapshot = copy_snapshot_for_pane(crate::tui::CopySelectionPane::Input)?;
     Some((snapshot.scroll, snapshot.visible_end))
 }
 
