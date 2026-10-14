@@ -1,6 +1,6 @@
 [package]
 name = "jcode"
-version = "0.95.1-smdex.8"
+version = "0.95.1-smdex.9"
 description = "Possibly the greatest coding agent ever built — blazing-fast TUI, multi-model, swarm coordination, 30+ tools"
 edition = "2024"
 autobins = false

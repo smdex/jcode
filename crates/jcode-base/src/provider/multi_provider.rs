@@ -219,13 +219,13 @@ impl MultiProvider {
                     .collect();
                 let first = *group.first()?;
                 let current_model = self.model();
-                if !context_only && first.1 == from {
-                    if let Some(preserved) = group
+                if !context_only
+                    && first.1 == from
+                    && let Some(preserved) = group
                         .iter()
                         .find(|candidate| candidate_model(candidate) == current_model)
-                    {
-                        return Some(*preserved);
-                    }
+                {
+                    return Some(*preserved);
                 }
                 let models: Vec<&str> = group
                     .iter()
@@ -234,13 +234,11 @@ impl MultiProvider {
                 if let Some(preferred) = crate::auth::lifecycle::preferred_model_for_provider(
                     Self::provider_key(first.1),
                     &models,
-                ) {
-                    if let Some(flagship) = group
-                        .iter()
-                        .find(|candidate| candidate_model(candidate) == preferred)
-                    {
-                        return Some(*flagship);
-                    }
+                ) && let Some(flagship) = group
+                    .iter()
+                    .find(|candidate| candidate_model(candidate) == preferred)
+                {
+                    return Some(*flagship);
                 }
                 group.into_iter().max_by_key(|candidate| {
                     models::context_limit_for_model_with_provider(
