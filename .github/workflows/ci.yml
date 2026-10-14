@@ -450,6 +450,11 @@ jobs:
             }
           }
 
+          # Pin the same Cargo version that the installer independently checks.
+          # Fork prerelease tags must not fall back to a canonical upstream tag.
+          $cargoVersion = Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
+          $env:JCODE_BUILD_SEMVER = $cargoVersion.Matches[0].Groups[1].Value
+
           & cargo build --locked --release --target x86_64-pc-windows-msvc
           if ($LASTEXITCODE -ne 0) {
             throw 'Windows release build failed'
