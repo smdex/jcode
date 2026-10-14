@@ -2783,8 +2783,7 @@ pub(crate) fn input_cursor_pos_from_screen(
     let hint_lines = input_hint_line_height(app) as usize;
     let visible_height = area.height as usize;
     let total_input_lines = wrapped_lines.len().max(1);
-    let cursor_char_pos =
-        crate::tui::core::byte_offset_to_char_index(input_text, app.cursor_pos());
+    let cursor_char_pos = crate::tui::core::byte_offset_to_char_index(input_text, app.cursor_pos());
     let cursor_line = wrapped_lines
         .iter()
         .position(|segment| {
