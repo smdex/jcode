@@ -67,7 +67,7 @@ pub(super) fn session_mode(state: &SessionUiState) -> &str {
     }
 }
 
-fn mode_options(state: &SessionUiState) -> Vec<Value> {
+pub(super) fn mode_options(state: &SessionUiState) -> Vec<Value> {
     let mut modes = vec![
         json!({"value": "solo", "name": "Solo", "description": "Normal agent execution with the selected provider effort"}),
     ];
@@ -92,7 +92,6 @@ pub(super) fn available_efforts(state: &SessionUiState) -> Vec<&'static str> {
         state.provider_name.as_deref(),
         state.model.as_deref(),
     )
-    .collect()
 }
 
 /// Build the ACP `configOptions` array (model selector plus reasoning effort)
@@ -148,18 +147,11 @@ pub(super) fn session_config_options(state: &SessionUiState) -> Vec<Value> {
     }
 
     let efforts = available_efforts(state);
-    if !efforts.is_empty() {
-        let current = state
-            .reasoning_effort
-            .as_deref()
-            .filter(|effort| efforts.contains(effort))
-            .unwrap_or_else(|| {
-                if efforts.contains(&"medium") {
-                    "medium"
-                } else {
-                    efforts[0]
-                }
-            });
+    if let Some(current) = state
+        .reasoning_effort
+        .as_deref()
+        .filter(|effort| efforts.contains(effort))
+    {
         let select_options: Vec<Value> = efforts
             .iter()
             .map(|name| json!({ "value": name, "name": name }))
