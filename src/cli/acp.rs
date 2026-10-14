@@ -1748,6 +1748,9 @@ async fn request_model_catalog(session: &DaemonSession) -> Result<ServerEvent> {
 }
 
 
+mod session_configuration;
+use session_configuration::*;
+
 async fn wait_for_model_changed(session: &DaemonSession, request_id: u64) -> Result<()> {
     loop {
         match session.read_event().await? {
