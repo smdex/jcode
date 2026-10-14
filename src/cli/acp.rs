@@ -1240,9 +1240,7 @@ impl AcpRuntime {
             }
         };
         let send_result = session.send(&request).await;
-        if let Err(err) = send_result {
-            return Err(err);
-        }
+        send_result?;
 
         let mut mapper = EventMapper::new(session.session_id.clone(), self.profile);
         let mut stop_reason = "end_turn".to_string();
