@@ -166,6 +166,8 @@ pub async fn run(options: CompanionOptions) -> Result<()> {
     jcode_base::env::set_var("JCODE_COMPANION", "1");
 
     let listener = bind(&options.socket)?;
+    #[cfg(windows)]
+    let mut listener = listener;
     let mut capabilities = vec![
         "open".to_string(),
         "reveal".to_string(),
