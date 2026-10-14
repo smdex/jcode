@@ -221,7 +221,8 @@ fn root_package_version(repo_root: &Path) -> Option<String> {
 
 fn parse_semver(value: &str) -> Option<(u32, u32, u32)> {
     let trimmed = value.trim().trim_start_matches('v');
-    let mut parts = trimmed.split('.');
+    let core = trimmed.split(['-', '+']).next()?;
+    let mut parts = core.split('.');
     let major = parts.next()?.parse().ok()?;
     let minor = parts.next()?.parse().ok()?;
     let patch = parts.next()?.parse().ok()?;
@@ -321,4 +322,17 @@ fn metadata_value(key: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_semver;
+
+    #[test]
+    fn parses_release_and_fork_version_cores() {
+        assert_eq!(parse_semver("v0.95.1"), Some((0, 95, 1)));
+        assert_eq!(parse_semver("0.95.1-smdex.7"), Some((0, 95, 1)));
+        assert_eq!(parse_semver("0.95.1+build.42"), Some((0, 95, 1)));
+        assert_eq!(parse_semver("0.95.invalid-smdex.7"), None);
+    }
 }
