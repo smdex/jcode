@@ -283,9 +283,9 @@ fn open_lock_file(lock_path: &Path) -> Result<File> {
         .read(true)
         .write(true)
         .create(true)
-        .open(&lock_path)
+        .open(lock_path)
         .context("could not open OAuth credential lock")?;
-    secure_file(&lock, &lock_path)?;
+    secure_file(&lock, lock_path)?;
     Ok(lock)
 }
 
