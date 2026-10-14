@@ -317,3 +317,16 @@ fn metadata_value(key: &str) -> Option<String> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::parse_semver;
+
+    #[test]
+    fn parses_release_and_fork_version_cores() {
+        assert_eq!(parse_semver("v0.95.1"), Some((0, 95, 1)));
+        assert_eq!(parse_semver("0.95.1-smdex.7"), Some((0, 95, 1)));
+        assert_eq!(parse_semver("0.95.1+build.42"), Some((0, 95, 1)));
+        assert_eq!(parse_semver("0.95.invalid-smdex.7"), None);
+    }
+}
