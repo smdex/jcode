@@ -3,7 +3,8 @@
 //! When jcode runs inside a herdr pane (`HERDR_ENV=1`), it reports its state
 //! (`idle` / `working`), the command that resumes the current session, and
 //! releases the pane when the user quits. The interactive TUI never blocks a
-//! turn on a user decision, so `blocked` is not reported. See
+//! turn on a user decision, so `blocked` is not reported. Subagent counts,
+//! names and tasks use display-only metadata, refreshed before its TTL. See
 //! <https://herdr.dev/docs/add-herdr-support/>.
 //!
 //! Reports go through `"$HERDR_BIN_PATH" pane report-agent ...` on a single
@@ -22,6 +23,10 @@ const SOURCE: &str = "jcode";
 const AGENT: &str = "jcode";
 /// Upper bound on a single herdr CLI call.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+const RETRY_INTERVAL: Duration = Duration::from_secs(1);
+const REFRESH_INTERVAL: Duration = Duration::from_secs(45);
+const METADATA_TTL_MS: &str = "120000";
+const METADATA_SOURCE: &str = "jcode:subagents";
 /// herdr's resume argv limits.
 const MAX_RESUME_ARGS: usize = 64;
 const MAX_RESUME_BYTES: usize = 8 * 1024;
@@ -41,12 +46,19 @@ impl AgentState {
     }
 }
 
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct MetadataReport {
+    pub summary: Option<String>,
+    pub title_suffix: Option<String>,
+}
+
 /// A state report plus, when known, the session that `resume_argv` reopens.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StateReport {
     pub state: AgentState,
     pub session_id: Option<String>,
     pub resume_argv: Option<Vec<String>>,
+    pub metadata: MetadataReport,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,13 +83,9 @@ impl HerdrEnv {
     }
 }
 
-enum Job {
-    Report(StateReport),
-}
-
 #[derive(Default)]
 struct Slot {
-    pending: Option<Job>,
+    pending: Option<StateReport>,
     released: bool,
 }
 
@@ -93,6 +101,7 @@ static LAST_SEQ: Mutex<u64> = Mutex::new(0);
 /// than 0.9.2 fails the whole report with a usage error on the `--` resume
 /// separator, so after that we keep reporting state without it.
 static RESUME_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
+static METADATA_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
 
 fn reporter() -> Option<&'static Reporter> {
     REPORTER
@@ -107,7 +116,7 @@ fn reporter() -> Option<&'static Reporter> {
             let worker_env = env.clone();
             let spawned = std::thread::Builder::new()
                 .name("herdr-reporter".into())
-                .spawn(move || worker_loop(worker_env, worker_slot));
+                .spawn(move || worker_loop(worker_env, worker_slot, REFRESH_INTERVAL));
             if let Err(error) = spawned {
                 crate::logging::warn(&format!("herdr: failed to start reporter: {error}"));
                 return None;
@@ -121,19 +130,24 @@ fn reporter() -> Option<&'static Reporter> {
         .as_ref()
 }
 
-/// Report the current state and session. Cheap enough for every UI tick:
-/// outside herdr it returns immediately, and unchanged state is dropped
-/// without allocating. A newer report replaces one that has not been sent.
-pub fn sync(state: AgentState, session_id: Option<&str>) {
+/// Avoid building display metadata outside a Herdr pane.
+pub fn enabled() -> bool {
+    reporter().is_some()
+}
+
+/// Queue the newest snapshot; unchanged reports are dropped, and the worker
+/// retries failures and refreshes metadata without requiring another UI event.
+pub fn sync(state: AgentState, session_id: Option<&str>, metadata: MetadataReport) {
     let Some(reporter) = reporter() else {
         return;
     };
     let report = {
         let mut last = lock(&reporter.last_submitted);
-        if last
-            .as_ref()
-            .is_some_and(|last| last.state == state && last.session_id.as_deref() == session_id)
-        {
+        if last.as_ref().is_some_and(|last| {
+            last.state == state
+                && last.session_id.as_deref() == session_id
+                && last.metadata == metadata
+        }) {
             return;
         }
         let report = StateReport {
@@ -141,6 +155,7 @@ pub fn sync(state: AgentState, session_id: Option<&str>) {
             session_id: session_id.map(str::to_owned),
             resume_argv: session_id
                 .and_then(|id| resume_argv_for_session(id, |key| std::env::var(key).ok())),
+            metadata,
         };
         *last = Some(report.clone());
         report
@@ -150,71 +165,151 @@ pub fn sync(state: AgentState, session_id: Option<&str>) {
     if slot.released {
         return;
     }
-    slot.pending = Some(Job::Report(report));
+    slot.pending = Some(report);
     wake.notify_one();
 }
 
 /// Release the pane because the user is quitting jcode. Blocks for at most
-/// [`COMMAND_TIMEOUT`]. Do not call this when jcode is about to exec itself
+/// two [`COMMAND_TIMEOUT`] calls (metadata cleanup and lifecycle release).
+/// Do not call this when jcode is about to exec itself
 /// (reload/update) since the same agent keeps running in the pane.
 pub fn release() {
     let Some(reporter) = reporter() else {
         return;
     };
-    {
+    release_reporter(reporter);
+}
+
+fn release_reporter(reporter: &Reporter) {
+    let (metadata_seq, state_seq) = {
         let mut slot = lock(&reporter.slot.0);
         if slot.released {
             return;
         }
         slot.released = true;
         slot.pending = None;
-    }
-    let seq = next_seq();
-    run_herdr(&reporter.env.bin, &release_args(&reporter.env.pane_id, seq));
+        reporter.slot.1.notify_one();
+        (next_seq(), next_seq())
+    };
+    // In-flight reports reserved their sequences under the same slot lock,
+    // so neither an old working state nor old metadata can undo this release.
+    send_metadata(&reporter.env, &MetadataReport::default(), metadata_seq);
+    run_herdr(
+        &reporter.env.bin,
+        &release_args(&reporter.env.pane_id, state_seq),
+    );
 }
 
-fn worker_loop(env: HerdrEnv, slot: Arc<(Mutex<Slot>, Condvar)>) {
+fn worker_loop(env: HerdrEnv, slot: Arc<(Mutex<Slot>, Condvar)>, refresh_interval: Duration) {
     let (lock_slot, wake) = &*slot;
+    let mut latest = None;
+    let mut due = Instant::now();
     loop {
-        let job = {
+        let (report, state_seq, retry_seq, metadata_seq) = {
             let mut guard = lock(lock_slot);
             loop {
                 if guard.released {
                     return;
                 }
-                if let Some(job) = guard.pending.take() {
-                    break job;
+                if let Some(report) = guard.pending.take() {
+                    latest = Some(report);
+                    break;
                 }
-                guard = wake.wait(guard).unwrap_or_else(|e| e.into_inner());
+                if latest.is_some() && Instant::now() >= due {
+                    break;
+                }
+                guard = if latest.is_some() {
+                    wake.wait_timeout(guard, due.saturating_duration_since(Instant::now()))
+                        .unwrap_or_else(|e| e.into_inner())
+                        .0
+                } else {
+                    wake.wait(guard).unwrap_or_else(|e| e.into_inner())
+                };
             }
+            (latest.clone().unwrap(), next_seq(), next_seq(), next_seq())
         };
-        match job {
-            Job::Report(report) => {
-                send_report(&env, report);
-            }
-        }
+        let state_ok = send_report(&env, report.clone(), state_seq, retry_seq);
+        let metadata_ok = send_metadata(&env, &report.metadata, metadata_seq);
+        due = Instant::now()
+            + if state_ok && metadata_ok {
+                refresh_interval
+            } else {
+                RETRY_INTERVAL
+            };
     }
 }
 
-fn send_report(env: &HerdrEnv, mut report: StateReport) {
+fn send_report(env: &HerdrEnv, mut report: StateReport, seq: u64, retry_seq: u64) -> bool {
     if RESUME_UNSUPPORTED.load(Ordering::Relaxed) {
         report.resume_argv = None;
     }
-    let status = run_herdr(&env.bin, &report_args(&env.pane_id, &report, next_seq()));
+    let status = run_herdr(&env.bin, &report_args(&env.pane_id, &report, seq));
     // Only a usage error on a report that carried a resume command means
-    // "this herdr predates resume". Timeouts and other failures are retried
-    // naturally by the next state change and must not disable resume.
+    // "this herdr predates resume". Transient failures must not disable resume.
     if !(is_usage_error(status) && resume_command(&report).is_some()) {
-        return;
+        return status.is_some_and(|status| status.success());
     }
     report.resume_argv = None;
-    let retry = run_herdr(&env.bin, &report_args(&env.pane_id, &report, next_seq()));
+    let retry = run_herdr(&env.bin, &report_args(&env.pane_id, &report, retry_seq));
     if retry.is_some_and(|status| status.success()) {
         RESUME_UNSUPPORTED.store(true, Ordering::Relaxed);
         crate::logging::info(
             "herdr: this herdr rejects resume commands (needs 0.9.2+), reporting state only",
         );
     }
+    retry.is_some_and(|status| status.success())
+}
+
+fn send_metadata(env: &HerdrEnv, metadata: &MetadataReport, seq: u64) -> bool {
+    if METADATA_UNSUPPORTED.load(Ordering::Relaxed) {
+        return true;
+    }
+    let status = run_herdr(&env.bin, &metadata_args(&env.pane_id, metadata, seq));
+    if is_usage_error(status) {
+        METADATA_UNSUPPORTED.store(true, Ordering::Relaxed);
+        crate::logging::info("herdr: metadata unsupported, continuing lifecycle reports");
+        return true;
+    }
+    status.is_some_and(|status| status.success())
+}
+
+fn metadata_args(pane_id: &str, metadata: &MetadataReport, seq: u64) -> Vec<String> {
+    let mut args: Vec<String> = [
+        "pane",
+        "report-metadata",
+        pane_id,
+        "--source",
+        METADATA_SOURCE,
+        "--agent",
+        AGENT,
+        "--applies-to-source",
+        SOURCE,
+        "--ttl-ms",
+        METADATA_TTL_MS,
+        "--seq",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect();
+    args.push(seq.to_string());
+    if let Some(summary) = &metadata.summary {
+        args.extend(["--token".into(), format!("summary={summary}")]);
+        for state in ["idle", "done", "working"] {
+            args.extend(["--state-label".into(), format!("{state}={summary}")]);
+        }
+    } else {
+        args.extend([
+            "--clear-state-labels".into(),
+            "--clear-token".into(),
+            "summary".into(),
+        ]);
+    }
+    if let Some(suffix) = &metadata.title_suffix {
+        args.extend(["--token".into(), format!("title-suffix={suffix}")]);
+    } else {
+        args.extend(["--clear-token".into(), "title-suffix".into()]);
+    }
+    args
 }
 
 /// Exit code clap-based CLIs such as herdr use for argument/usage errors.
@@ -430,6 +525,7 @@ mod tests {
             state: AgentState::Idle,
             session_id: Some("session_fox_123".into()),
             resume_argv: resume_argv_for_session("session_fox_123", |_| None),
+            metadata: MetadataReport::default(),
         };
         assert_eq!(
             report_args("p1", &report, 42),
@@ -461,6 +557,7 @@ mod tests {
             state: AgentState::Working,
             session_id: None,
             resume_argv: None,
+            metadata: MetadataReport::default(),
         };
         let args = report_args("p1", &report, 7);
         assert_eq!(&args[7..], ["--state", "working", "--seq", "7"]);
@@ -548,6 +645,7 @@ mod tests {
             static SERIAL: Mutex<()> = Mutex::new(());
             let serial = lock(&SERIAL);
             RESUME_UNSUPPORTED.store(false, Ordering::Relaxed);
+            METADATA_UNSUPPORTED.store(false, Ordering::Relaxed);
             let dir = std::env::temp_dir().join(format!(
                 "jcode-herdr-fake-{}-{}",
                 std::process::id(),
@@ -589,6 +687,7 @@ mod tests {
     impl Drop for FakeHerdr {
         fn drop(&mut self) {
             RESUME_UNSUPPORTED.store(false, Ordering::Relaxed);
+            METADATA_UNSUPPORTED.store(false, Ordering::Relaxed);
             let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
@@ -599,6 +698,7 @@ mod tests {
             state: AgentState::Idle,
             session_id: Some("session_fox_1".into()),
             resume_argv: resume_argv_for_session("session_fox_1", |_| None),
+            metadata: MetadataReport::default(),
         }
     }
 
@@ -607,9 +707,19 @@ mod tests {
     fn report_falls_back_to_state_only_when_herdr_rejects_resume() {
         // herdr < 0.9.2 treats the `--` resume separator as a usage error.
         let herdr = FakeHerdr::new(USAGE_ERROR_EXIT_CODE);
-        send_report(&herdr.env, idle_report_with_resume());
+        send_report(
+            &herdr.env,
+            idle_report_with_resume(),
+            next_seq(),
+            next_seq(),
+        );
         assert!(RESUME_UNSUPPORTED.load(Ordering::Relaxed));
-        send_report(&herdr.env, idle_report_with_resume());
+        send_report(
+            &herdr.env,
+            idle_report_with_resume(),
+            next_seq(),
+            next_seq(),
+        );
 
         let calls = herdr.calls();
         assert_eq!(calls.len(), 3, "{calls:?}");
@@ -622,10 +732,212 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn herdr_worker_retries_failed_idle_without_another_state_change() {
+        let herdr = FakeHerdr::new(1);
+        let slot = Arc::new((Mutex::new(Slot::default()), Condvar::new()));
+        lock(&slot.0).pending = Some(idle_report_with_resume());
+        let worker_slot = Arc::clone(&slot);
+        let env = herdr.env.clone();
+        let worker = std::thread::spawn(move || worker_loop(env, worker_slot, REFRESH_INTERVAL));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let state_calls = || {
+            herdr
+                .calls()
+                .iter()
+                .filter(|call| call.contains(" report-agent "))
+                .count()
+        };
+        while state_calls() < 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        lock(&slot.0).released = true;
+        slot.1.notify_one();
+        worker.join().unwrap();
+        assert!(state_calls() >= 2, "failed idle must be retried");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn herdr_metadata_sets_and_clears_owned_fields_as_literal_arguments() {
+        let herdr = FakeHerdr::new(0);
+        std::fs::write(
+            &herdr.env.bin,
+            "#!/bin/sh\nprintf '%s\\0' \"$@\" >> \"$(dirname \"$0\")/argv\"\nexit 0\n",
+        )
+        .unwrap();
+        let metadata = MetadataReport {
+            summary: Some("⏳ 2 subagents (scout, reviewer) · review '$HOME'; 東京".into()),
+            title_suffix: Some("⏳2⚠".into()),
+        };
+        assert!(send_metadata(&herdr.env, &metadata, 42));
+        let bytes = std::fs::read(herdr.dir.join("argv")).unwrap();
+        let args: Vec<_> = bytes
+            .split(|b| *b == 0)
+            .filter(|arg| !arg.is_empty())
+            .map(|arg| std::str::from_utf8(arg).unwrap())
+            .collect();
+        assert!(args.windows(2).any(|p| p == ["--source", METADATA_SOURCE]));
+        assert!(
+            args.windows(2)
+                .any(|p| p == ["--applies-to-source", SOURCE])
+        );
+        assert!(args.windows(2).any(|p| p == ["--ttl-ms", METADATA_TTL_MS]));
+        assert!(args.windows(2).any(|p| p == ["--seq", "42"]));
+        for state in ["idle", "done", "working"] {
+            assert!(
+                args.contains(&format!("{state}={}", metadata.summary.as_ref().unwrap()).as_str())
+            );
+        }
+        assert!(args.contains(&"title-suffix=⏳2⚠"));
+        assert!(!args.contains(&"--clear-token"));
+        std::fs::remove_file(herdr.dir.join("argv")).unwrap();
+        assert!(send_metadata(&herdr.env, &MetadataReport::default(), 43));
+        let bytes = std::fs::read(herdr.dir.join("argv")).unwrap();
+        let args: Vec<_> = bytes
+            .split(|b| *b == 0)
+            .filter(|arg| !arg.is_empty())
+            .map(|arg| std::str::from_utf8(arg).unwrap())
+            .collect();
+        assert!(args.contains(&"--clear-state-labels"));
+        assert!(args.windows(2).any(|p| p == ["--clear-token", "summary"]));
+        assert!(
+            args.windows(2)
+                .any(|p| p == ["--clear-token", "title-suffix"])
+        );
+        assert!(!args.contains(&"--token"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn herdr_old_metadata_cli_does_not_disable_lifecycle_reporting() {
+        let herdr = FakeHerdr::new(0);
+        std::fs::write(&herdr.env.bin,
+            "#!/bin/sh\necho \"$*\" >> \"$(dirname \"$0\")/calls.log\"\n[ \"$2\" = report-metadata ] && exit 2\nexit 0\n"
+        ).unwrap();
+        assert!(send_metadata(
+            &herdr.env,
+            &MetadataReport::default(),
+            next_seq()
+        ));
+        assert!(METADATA_UNSUPPORTED.load(Ordering::Relaxed));
+        assert!(send_metadata(
+            &herdr.env,
+            &MetadataReport::default(),
+            next_seq()
+        ));
+        assert!(send_report(
+            &herdr.env,
+            idle_report_with_resume(),
+            next_seq(),
+            next_seq()
+        ));
+        assert_eq!(herdr.calls().len(), 2);
+        assert!(herdr.calls()[1].contains("--state idle"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn herdr_worker_refreshes_live_metadata_and_keeps_newest_snapshot() {
+        let herdr = FakeHerdr::new(0);
+        let mut report = idle_report_with_resume();
+        report.state = AgentState::Working;
+        report.metadata = MetadataReport {
+            summary: Some("one child".into()),
+            title_suffix: Some("⏳1".into()),
+        };
+        let slot = Arc::new((
+            Mutex::new(Slot {
+                pending: Some(report),
+                released: false,
+            }),
+            Condvar::new(),
+        ));
+        let env = herdr.env.clone();
+        let worker_slot = Arc::clone(&slot);
+        let worker =
+            std::thread::spawn(move || worker_loop(env, worker_slot, Duration::from_millis(20)));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while herdr
+            .calls()
+            .iter()
+            .filter(|call| call.contains("summary=one child"))
+            .count()
+            < 2
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // A final idle snapshot supersedes both the old active report and its heartbeat.
+        lock(&slot.0).pending = Some(idle_report_with_resume());
+        slot.1.notify_one();
+        while !herdr
+            .calls()
+            .iter()
+            .any(|call| call.contains("--state idle"))
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        lock(&slot.0).released = true;
+        slot.1.notify_one();
+        worker.join().unwrap();
+        let calls = herdr.calls();
+        assert!(
+            calls
+                .iter()
+                .filter(|call| call.contains("summary=one child"))
+                .count()
+                >= 2
+        );
+        let idle = calls
+            .iter()
+            .position(|call| call.contains("--state idle"))
+            .expect("idle sent");
+        assert!(
+            calls[idle + 1..].iter().all(
+                |call| !call.contains("summary=one child") && !call.contains("--state working")
+            )
+        );
+        assert!(calls.last().unwrap().contains("--clear-token summary"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn herdr_release_clears_metadata_and_wakes_worker_without_resurrection() {
+        let herdr = FakeHerdr::new(0);
+        let slot = Arc::new((Mutex::new(Slot::default()), Condvar::new()));
+        let reporter = Reporter {
+            env: herdr.env.clone(),
+            slot: Arc::clone(&slot),
+            last_submitted: Mutex::new(None),
+        };
+        let env = herdr.env.clone();
+        let worker_slot = Arc::clone(&slot);
+        let worker = std::thread::spawn(move || worker_loop(env, worker_slot, REFRESH_INTERVAL));
+        release_reporter(&reporter);
+        worker.join().unwrap();
+        release_reporter(&reporter);
+        let calls = herdr.calls();
+        assert_eq!(calls.len(), 2, "release is idempotent: {calls:?}");
+        assert!(calls[0].contains("report-metadata") && calls[0].contains("--clear-state-labels"));
+        assert!(
+            calls[0].contains("--clear-token summary")
+                && calls[0].contains("--clear-token title-suffix")
+        );
+        assert!(calls[1].contains("release-agent"));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn report_keeps_resume_after_non_usage_failure() {
         // A transient failure (not a usage error) must not disable resume.
         let herdr = FakeHerdr::new(1);
-        send_report(&herdr.env, idle_report_with_resume());
+        send_report(
+            &herdr.env,
+            idle_report_with_resume(),
+            next_seq(),
+            next_seq(),
+        );
         assert!(!RESUME_UNSUPPORTED.load(Ordering::Relaxed));
 
         let calls = herdr.calls();
