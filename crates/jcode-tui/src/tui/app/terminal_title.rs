@@ -60,20 +60,96 @@ fn title_with_metrics(
     title
 }
 
+fn metadata_text(text: &str, width: usize) -> String {
+    let clean: String = text
+        .chars()
+        .take(80)
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let clean = clean.split_whitespace().collect::<Vec<_>>().join(" ");
+    jcode_tui_render::truncate_line_with_ellipsis_to_width(&ratatui::text::Line::from(clean), width)
+        .to_string()
+}
+
 impl App {
     /// Tell herdr (when running in a herdr pane) whether this client is
     /// working or idle and which session to resume. Tick-safe: unchanged
     /// state is a cheap comparison and reports are sent off-thread.
     pub(super) fn sync_herdr_agent_state(&self) {
-        if self.suppress_terminal_title_updates || !self.is_remote_client() {
+        if self.suppress_terminal_title_updates
+            || self.is_replay_runtime()
+            || !crate::tui::herdr::enabled()
+        {
             return;
         }
-        let state = if self.is_processing() {
-            crate::tui::herdr::AgentState::Working
+        let (state, metadata) = self.herdr_state_and_metadata();
+        crate::tui::herdr::sync(state, self.active_client_session_id(), metadata);
+    }
+
+    fn herdr_state_and_metadata(
+        &self,
+    ) -> (
+        crate::tui::herdr::AgentState,
+        crate::tui::herdr::MetadataReport,
+    ) {
+        use crate::tui::herdr::{AgentState, MetadataReport};
+        let members = self
+            .active_client_session_id()
+            .map(|id| super::tui_state::filter_inline_swarm_subtree(&self.remote_swarm_members, id))
+            .unwrap_or_default();
+        let active: Vec<_> = members
+            .iter()
+            .filter(|member| {
+                jcode_tui_render::swarm_gallery::is_active_status(&member.status)
+                    || matches!(member.status.as_str(), "blocked" | "waiting_network")
+            })
+            .collect();
+        // Child attention belongs to the parent agent, not a human-blocked pane.
+        let attention = active
+            .iter()
+            .any(|member| matches!(member.status.as_str(), "blocked" | "waiting_network"));
+        let state = if self.is_processing() || !active.is_empty() {
+            AgentState::Working
         } else {
-            crate::tui::herdr::AgentState::Idle
+            AgentState::Idle
         };
-        crate::tui::herdr::sync(state, self.active_client_session_id());
+        if active.is_empty() {
+            return (state, MetadataReport::default());
+        }
+        let names = active
+            .iter()
+            .take(3)
+            .map(|member| {
+                metadata_text(
+                    member
+                        .friendly_name
+                        .as_deref()
+                        .unwrap_or(&member.session_id),
+                    24,
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let task = active
+            .iter()
+            .find_map(|member| member.task_label.as_deref())
+            .map(|task| metadata_text(task, 60))
+            .filter(|task| !task.is_empty());
+        let count = active.len();
+        let summary = format!(
+            "⏳ {count} subagent{}{} ({names}{}){}",
+            if count == 1 { "" } else { "s" },
+            if attention { " ⚠" } else { "" },
+            if count > 3 { ", …" } else { "" },
+            task.map(|task| format!(" · {task}")).unwrap_or_default(),
+        );
+        (
+            state,
+            MetadataReport {
+                summary: Some(metadata_text(&summary, 80)),
+                title_suffix: Some(format!("⏳{count}{}", if attention { "⚠" } else { "" })),
+            },
+        )
     }
 
     pub(super) fn set_terminal_title_base(&self, session_id: &str, base: String) {
@@ -138,6 +214,188 @@ impl App {
 mod tests {
     use super::*;
     use crate::message::ToolCall;
+
+    #[test]
+    fn herdr_state_follows_send_done_interrupt_error_and_queued_work() {
+        use crate::protocol::ServerEvent;
+        use crate::tui::herdr::AgentState::{Idle, Working};
+        let mut app = super::super::tests::create_test_app();
+        app.is_remote = true;
+        app.remote_session_id = Some("parent".into());
+        app.auto_poke_incomplete_todos = false;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut remote = crate::tui::backend::RemoteConnection::dummy();
+            assert_eq!(app.herdr_state_and_metadata().0, Idle);
+            for ending in ["done", "interrupted", "error"] {
+                let id = super::super::remote::begin_remote_send(
+                    &mut app,
+                    &mut remote,
+                    "hello".into(),
+                    vec![],
+                    false,
+                    None,
+                    false,
+                    0,
+                )
+                .await
+                .unwrap();
+                assert_eq!(app.herdr_state_and_metadata().0, Working);
+                app.handle_server_event(ServerEvent::Done { id: id + 100 }, &mut remote);
+                assert_eq!(app.herdr_state_and_metadata().0, Working, "unrelated Done");
+                let event = match ending {
+                    "done" => ServerEvent::Done { id },
+                    "interrupted" => ServerEvent::Interrupted,
+                    _ => ServerEvent::Error {
+                        id,
+                        message: "test failure".into(),
+                        retry_after_secs: None,
+                    },
+                };
+                app.handle_server_event(event, &mut remote);
+                assert_eq!(app.herdr_state_and_metadata().0, Idle, "{ending}");
+            }
+            app.pending_queued_dispatch = true;
+            assert_eq!(app.herdr_state_and_metadata().0, Working);
+            app.pending_queued_dispatch = false;
+            assert_eq!(app.herdr_state_and_metadata().0, Idle);
+        });
+    }
+
+    #[test]
+    fn herdr_metadata_tracks_only_current_sessions_live_descendants() {
+        use crate::protocol::ServerEvent;
+        use crate::tui::herdr::{
+            AgentState::{Idle, Working},
+            MetadataReport,
+        };
+        let mut app = super::super::tests::create_test_app();
+        app.is_remote = true;
+        app.remote_session_id = Some("parent".into());
+        app.swarm_enabled = true;
+        let member = |id: &str, parent: &str, status: &str| {
+            serde_json::from_value(serde_json::json!({
+                "session_id": id, "friendly_name": id, "status": status,
+                "task_label": "Review\n東京\u{1b} task", "report_back_to_session_id": parent,
+            }))
+            .unwrap()
+        };
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let mut remote = crate::tui::backend::RemoteConnection::dummy();
+        app.handle_server_event(
+            ServerEvent::SwarmStatus {
+                members: vec![
+                    member("parent", "someone", "running"),
+                    member("scout", "parent", "running"),
+                    member("reviewer", "scout", "blocked"),
+                    member("peer", "someone", "running"),
+                    member("finished", "parent", "completed"),
+                ],
+            },
+            &mut remote,
+        );
+        let (state, metadata) = app.herdr_state_and_metadata();
+        assert_eq!(state, Working, "live children keep an idle parent busy");
+        let summary = metadata.summary.unwrap();
+        assert!(summary.contains("2 subagents"), "{summary}");
+        assert!(summary.contains("scout") && summary.contains("reviewer"));
+        assert!(summary.contains('⚠'));
+        assert!(!summary.contains("peer") && !summary.contains("finished"));
+        assert!(!summary.chars().any(char::is_control));
+        assert!(metadata.title_suffix.unwrap().contains("2"));
+        app.remote_session_id = Some("unrelated".into());
+        assert_eq!(
+            app.herdr_state_and_metadata(),
+            (Idle, MetadataReport::default())
+        );
+        app.remote_session_id = Some("parent".into());
+        for status in ["ready", "completed", "failed", "crashed", "stopped", "done"] {
+            app.handle_server_event(
+                ServerEvent::SwarmStatus {
+                    members: vec![member("scout", "parent", status)],
+                },
+                &mut remote,
+            );
+            assert_eq!(
+                app.herdr_state_and_metadata(),
+                (Idle, MetadataReport::default()),
+                "{status}"
+            );
+        }
+    }
+
+    #[test]
+    fn herdr_disconnect_invalidates_children_until_authoritative_status_returns() {
+        use crate::protocol::ServerEvent;
+        use crate::tui::herdr::{
+            AgentState::{Idle, Working},
+            MetadataReport,
+        };
+        let mut app = super::super::tests::create_test_app();
+        app.is_remote = true;
+        app.remote_session_id = Some("parent".into());
+        app.swarm_enabled = true;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let _guard = rt.enter();
+        let mut remote = crate::tui::backend::RemoteConnection::dummy();
+        let member = serde_json::from_value(serde_json::json!({
+            "session_id": "child", "status": "running",
+            "report_back_to_session_id": "parent",
+        }))
+        .unwrap();
+        app.handle_server_event(
+            ServerEvent::SwarmStatus {
+                members: vec![member],
+            },
+            &mut remote,
+        );
+        assert_eq!(app.herdr_state_and_metadata().0, Working);
+        // A redraw immediately after disconnect must not re-report cosmetic
+        // split-launch activity or queued-but-undispatched work as Working.
+        app.pending_split_started_at = Some(Instant::now());
+        app.pending_queued_dispatch = true;
+        app.queued_messages.push("keep this follow-up".into());
+        super::super::remote::handle_disconnect(
+            &mut app,
+            &mut super::super::remote::RemoteRunState::default(),
+            None,
+        );
+        assert_eq!(
+            app.herdr_state_and_metadata(),
+            (Idle, MetadataReport::default())
+        );
+        assert!(app.remote_swarm_members_received_at.is_none());
+        assert!(!app.is_processing());
+        assert_eq!(app.queued_messages, ["keep this follow-up"]);
+        app.sync_herdr_agent_state();
+        let member = serde_json::from_value(serde_json::json!({
+            "session_id": "child", "status": "running",
+            "report_back_to_session_id": "parent",
+        }))
+        .unwrap();
+        app.handle_server_event(
+            ServerEvent::SwarmStatus {
+                members: vec![member],
+            },
+            &mut remote,
+        );
+        assert_eq!(app.herdr_state_and_metadata().0, Working);
+    }
+
+    #[test]
+    fn herdr_metadata_is_bounded_in_characters_and_display_cells() {
+        for text in [
+            "東京".repeat(90),
+            "e\u{301}".repeat(90),
+            "\n\t\u{1b}".repeat(90),
+        ] {
+            let text = metadata_text(&text, 80);
+            assert!(text.chars().count() <= 80);
+            assert!(unicode_width::UnicodeWidthStr::width(text.as_str()) <= 80);
+            assert!(!text.chars().any(char::is_control));
+        }
+    }
 
     #[test]
     fn terminal_title_counts_follow_append_remove_and_history_replace() {
