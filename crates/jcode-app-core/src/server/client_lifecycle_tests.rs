@@ -1704,6 +1704,7 @@ async fn message_with_late_installed_skill_reaches_completion() {
             images: Vec::new(),
             system_reminder: None,
             active_skill: Some(skill_name.into()),
+            server_failover: false,
         },
         session_id,
         &mut ProcessingState {

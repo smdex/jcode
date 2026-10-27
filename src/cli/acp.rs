@@ -698,7 +698,13 @@ impl AcpRuntime {
         let runtime = self.clone();
         tokio::spawn(async move {
             let result = runtime
-                .run_prompt(id.clone(), Arc::clone(&session), text, images, explicit_skill)
+                .run_prompt(
+                    id.clone(),
+                    Arc::clone(&session),
+                    text,
+                    images,
+                    explicit_skill,
+                )
                 .await;
             // The task owns cleanup exactly once, including every I/O failure.
             cleanup_prompt_state(&session).await;
@@ -1897,7 +1903,6 @@ async fn request_model_catalog(session: &DaemonSession) -> Result<ServerEvent> {
         }
     }
 }
-
 
 mod session_configuration;
 use session_configuration::*;
