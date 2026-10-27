@@ -4,18 +4,25 @@ use std::path::Path;
 /// Accept release identities without accepting arbitrary environment text.
 pub fn release_semver(value: &str) -> Option<String> {
     let value = value.trim().strip_prefix('v').unwrap_or(value.trim());
-    let (core, preview) = match value.split_once('-') {
-        Some((core, suffix)) => (core, Some(suffix.strip_prefix("preview.")?)),
+    let (core, prerelease) = match value.split_once('-') {
+        Some((core, suffix)) => (core, Some(suffix)),
         None => (value, None),
     };
     let components: Vec<_> = core.split('.').collect();
     if components.len() != 3 || components.iter().any(|part| !numeric_component(part)) {
         return None;
     }
-    if let Some(number) = preview
-        && (core != "1.0.0" || !numeric_component(number) || number == "0")
-    {
-        return None;
+    if let Some(suffix) = prerelease {
+        let number = if let Some(number) = suffix.strip_prefix("smdex.") {
+            number
+        } else if core == "1.0.0" {
+            suffix.strip_prefix("preview.")?
+        } else {
+            return None;
+        };
+        if !numeric_component(number) || number == "0" {
+            return None;
+        }
     }
     Some(value.to_string())
 }
@@ -50,7 +57,12 @@ mod tests {
 
     #[test]
     fn release_identity_accepts_stable_and_v1_previews() {
-        for value in ["1.2.3", "1.0.0-preview.1", "1.0.0-preview.123"] {
+        for value in [
+            "1.2.3",
+            "1.0.0-preview.1",
+            "1.0.0-preview.123",
+            "0.99.2-smdex.1",
+        ] {
             assert_eq!(release_semver(value).as_deref(), Some(value));
         }
         assert_eq!(
@@ -58,6 +70,10 @@ mod tests {
             Some("1.0.0-preview.2")
         );
         for value in [
+            "0.99.2-smdex.0",
+            "0.99.2-smdex.01",
+            "0.99.2-smdex.1-dev",
+            "0.99.2-unknown.1",
             "1.2",
             "1.2.3.4",
             "1.0.0-preview.0",
