@@ -2930,4 +2930,7 @@ mod tests {
             crate::provider::DEFAULT_CONTEXT_LIMIT as u64
         );
     }
+
+    #[path = "acp_protocol_tests.rs"]
+    mod protocol_tests;
 }
