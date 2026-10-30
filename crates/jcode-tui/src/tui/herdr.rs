@@ -27,6 +27,24 @@ const RETRY_INTERVAL: Duration = Duration::from_secs(1);
 const REFRESH_INTERVAL: Duration = Duration::from_secs(45);
 const METADATA_TTL_MS: &str = "120000";
 const METADATA_SOURCE: &str = "jcode:subagents";
+// Keep the source stable so upgrades replace old summaries rather than competing with them.
+// Herdr permits 16 token updates (including clears): these 14 plus summary/title-suffix.
+const DETAIL_TOKENS: &[&str] = &[
+    "model",
+    "provider",
+    "thinking",
+    "ctx",
+    "input-tokens",
+    "output-tokens",
+    "subagent-count",
+    "subagent-attention",
+    "subagent-1",
+    "subagent-task-1",
+    "subagent-2",
+    "subagent-task-2",
+    "subagent-3",
+    "subagent-task-3",
+];
 /// herdr's resume argv limits.
 const MAX_RESUME_ARGS: usize = 64;
 const MAX_RESUME_BYTES: usize = 8 * 1024;
@@ -50,6 +68,8 @@ impl AgentState {
 pub struct MetadataReport {
     pub summary: Option<String>,
     pub title_suffix: Option<String>,
+    pub title: Option<String>,
+    pub tokens: Vec<(&'static str, String)>,
 }
 
 /// A state report plus, when known, the session that `resume_argv` reopens.
@@ -202,8 +222,9 @@ fn release_reporter(reporter: &Reporter) {
 
 fn worker_loop(env: HerdrEnv, slot: Arc<(Mutex<Slot>, Condvar)>, refresh_interval: Duration) {
     let (lock_slot, wake) = &*slot;
-    let mut latest = None;
+    let mut latest: Option<StateReport> = None;
     let mut due = Instant::now();
+    let mut metadata_due = Instant::now();
     loop {
         let (report, state_seq, retry_seq, metadata_seq) = {
             let mut guard = lock(lock_slot);
@@ -211,7 +232,14 @@ fn worker_loop(env: HerdrEnv, slot: Arc<(Mutex<Slot>, Condvar)>, refresh_interva
                 if guard.released {
                     return;
                 }
-                if let Some(report) = guard.pending.take() {
+                let state_changed = guard.pending.as_ref().is_some_and(|pending| {
+                    latest.as_ref().is_none_or(|last| {
+                        pending.state != last.state || pending.session_id != last.session_id
+                    })
+                });
+                if (state_changed || Instant::now() >= metadata_due)
+                    && let Some(report) = guard.pending.take()
+                {
                     latest = Some(report);
                     break;
                 }
@@ -219,7 +247,12 @@ fn worker_loop(env: HerdrEnv, slot: Arc<(Mutex<Slot>, Condvar)>, refresh_interva
                     break;
                 }
                 guard = if latest.is_some() {
-                    wake.wait_timeout(guard, due.saturating_duration_since(Instant::now()))
+                    let deadline = if guard.pending.is_some() {
+                        due.min(metadata_due)
+                    } else {
+                        due
+                    };
+                    wake.wait_timeout(guard, deadline.saturating_duration_since(Instant::now()))
                         .unwrap_or_else(|e| e.into_inner())
                         .0
                 } else {
@@ -230,6 +263,8 @@ fn worker_loop(env: HerdrEnv, slot: Arc<(Mutex<Slot>, Condvar)>, refresh_interva
         };
         let state_ok = send_report(&env, report.clone(), state_seq, retry_seq);
         let metadata_ok = send_metadata(&env, &report.metadata, metadata_seq);
+        // Streaming counters coalesce to one update per second; lifecycle changes bypass this.
+        metadata_due = Instant::now() + Duration::from_secs(1);
         due = Instant::now()
             + if state_ok && metadata_ok {
                 refresh_interval
@@ -292,6 +327,18 @@ fn metadata_args(pane_id: &str, metadata: &MetadataReport, seq: u64) -> Vec<Stri
     .map(str::to_owned)
     .collect();
     args.push(seq.to_string());
+    if let Some(title) = &metadata.title {
+        args.extend(["--title".into(), title.clone()]);
+    } else {
+        args.push("--clear-title".into());
+    }
+    for key in DETAIL_TOKENS {
+        if let Some((_, value)) = metadata.tokens.iter().find(|(name, _)| name == key) {
+            args.extend(["--token".into(), format!("{key}={value}")]);
+        } else {
+            args.extend(["--clear-token".into(), (*key).into()]);
+        }
+    }
     if let Some(summary) = &metadata.summary {
         args.extend(["--token".into(), format!("summary={summary}")]);
         for state in ["idle", "done", "working"] {
@@ -768,6 +815,8 @@ mod tests {
         let metadata = MetadataReport {
             summary: Some("⏳ 2 subagents (scout, reviewer) · review '$HOME'; 東京".into()),
             title_suffix: Some("⏳2⚠".into()),
+            title: Some("Review '$HOME'; 東京".into()),
+            tokens: vec![("model", "model with spaces".into())],
         };
         assert!(send_metadata(&herdr.env, &metadata, 42));
         let bytes = std::fs::read(herdr.dir.join("argv")).unwrap();
@@ -783,13 +832,27 @@ mod tests {
         );
         assert!(args.windows(2).any(|p| p == ["--ttl-ms", METADATA_TTL_MS]));
         assert!(args.windows(2).any(|p| p == ["--seq", "42"]));
+        assert_eq!(
+            args.iter()
+                .filter(|arg| matches!(**arg, "--token" | "--clear-token"))
+                .count(),
+            16
+        );
         for state in ["idle", "done", "working"] {
             assert!(
                 args.contains(&format!("{state}={}", metadata.summary.as_ref().unwrap()).as_str())
             );
         }
         assert!(args.contains(&"title-suffix=⏳2⚠"));
-        assert!(!args.contains(&"--clear-token"));
+        assert!(
+            args.windows(2)
+                .any(|p| p == ["--title", "Review '$HOME'; 東京"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|p| p == ["--token", "model=model with spaces"])
+        );
+        assert!(args.windows(2).any(|p| p == ["--clear-token", "ctx"]));
         std::fs::remove_file(herdr.dir.join("argv")).unwrap();
         assert!(send_metadata(&herdr.env, &MetadataReport::default(), 43));
         let bytes = std::fs::read(herdr.dir.join("argv")).unwrap();
@@ -805,6 +868,10 @@ mod tests {
                 .any(|p| p == ["--clear-token", "title-suffix"])
         );
         assert!(!args.contains(&"--token"));
+        assert!(args.contains(&"--clear-title"));
+        for key in DETAIL_TOKENS {
+            assert!(args.windows(2).any(|p| p == ["--clear-token", key]));
+        }
     }
 
     #[cfg(unix)]
@@ -844,6 +911,7 @@ mod tests {
         report.metadata = MetadataReport {
             summary: Some("one child".into()),
             title_suffix: Some("⏳1".into()),
+            ..MetadataReport::default()
         };
         let slot = Arc::new((
             Mutex::new(Slot {
@@ -899,6 +967,58 @@ mod tests {
             )
         );
         assert!(calls.last().unwrap().contains("--clear-token summary"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn herdr_worker_coalesces_metadata_but_sends_lifecycle_changes_immediately() {
+        let herdr = FakeHerdr::new(0);
+        let mut report = idle_report_with_resume();
+        report.state = AgentState::Working;
+        let slot = Arc::new((
+            Mutex::new(Slot {
+                pending: Some(report.clone()),
+                released: false,
+            }),
+            Condvar::new(),
+        ));
+        let env = herdr.env.clone();
+        let worker_slot = Arc::clone(&slot);
+        let worker = std::thread::spawn(move || worker_loop(env, worker_slot, REFRESH_INTERVAL));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while herdr.calls().len() < 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        for index in 0..10 {
+            report.metadata.title = Some(format!("stream {index}"));
+            lock(&slot.0).pending = Some(report.clone());
+            slot.1.notify_one();
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        let coalesced = herdr.calls().len() == 2;
+        lock(&slot.0).pending = Some(idle_report_with_resume());
+        slot.1.notify_one();
+        while !herdr
+            .calls()
+            .iter()
+            .any(|call| call.contains("--state idle"))
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        lock(&slot.0).released = true;
+        slot.1.notify_one();
+        worker.join().unwrap();
+        let calls = herdr.calls();
+        assert!(coalesced, "metadata burst was not coalesced: {calls:?}");
+        assert!(
+            calls.iter().any(|call| call.contains("--state idle")),
+            "idle was lost: {calls:?}"
+        );
+        assert!(
+            calls.iter().all(|call| !call.contains("--title stream")),
+            "superseded metadata was sent: {calls:?}"
+        );
     }
 
     #[cfg(unix)]
