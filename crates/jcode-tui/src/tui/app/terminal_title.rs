@@ -113,8 +113,138 @@ impl App {
         } else {
             AgentState::Idle
         };
+        use crate::tui::TuiState;
+        let mut metadata = MetadataReport::default();
+        if let Some(id) = self.active_client_session_id() {
+            let title = self.terminal_title.borrow();
+            let base = if title.session_id == id && !title.base.is_empty() {
+                Some(title.base.clone())
+            } else {
+                self.session_display_name()
+            };
+            let work = if self.is_processing() {
+                self.display_turn_duration_secs()
+                    .filter(|secs| secs.is_finite() && *secs >= 0.0)
+                    .map(Duration::from_secs_f32)
+            } else if title.session_id == id {
+                title.last_work
+            } else {
+                None
+            };
+            metadata.title = base.filter(|base| !base.is_empty()).map(|base| {
+                metadata_text(
+                    &title_with_metrics(
+                        &base,
+                        self.display_edit_line_counts,
+                        work,
+                        self.is_processing(),
+                    ),
+                    80,
+                )
+            });
+        }
+        if !self.is_remote || !self.remote_session_facts_provisional {
+            let (model, provider, thinking) = if self.is_remote {
+                (
+                    self.remote_provider_model.clone(),
+                    self.remote_provider_name.clone(),
+                    self.remote_reasoning_effort.clone(),
+                )
+            } else {
+                (
+                    Some(TuiState::provider_model(self)),
+                    Some(TuiState::provider_name(self)),
+                    self.provider.reasoning_effort(),
+                )
+            };
+            for (key, value) in [
+                ("model", model),
+                ("provider", provider),
+                ("thinking", thinking),
+            ] {
+                if let Some(value) = value {
+                    let value = metadata_text(&value, 80);
+                    if !value.is_empty() && value != "unknown" {
+                        metadata.tokens.push((key, value));
+                    }
+                }
+            }
+            if self.context_limit > 0 {
+                if let Some(used) = self.current_stream_context_tokens() {
+                    let percent = used.saturating_mul(100) / self.context_limit;
+                    metadata.tokens.push(("ctx", format!("{percent}%")));
+                }
+            }
+        }
+        // Local restores do not hydrate accounting; session totals need authoritative history.
+        if let Some((history_in, history_out)) = self.remote_total_tokens.filter(|_| self.is_remote)
+        {
+            metadata.tokens.extend([
+                (
+                    "input-tokens",
+                    history_in
+                        .saturating_add(self.token_accounting.total_input_tokens)
+                        .to_string(),
+                ),
+                (
+                    "output-tokens",
+                    history_out
+                        .saturating_add(self.token_accounting.total_output_tokens)
+                        .to_string(),
+                ),
+            ]);
+        }
         if active.is_empty() {
-            return (state, MetadataReport::default());
+            return (state, metadata);
+        }
+        metadata
+            .tokens
+            .push(("subagent-count", active.len().to_string()));
+        metadata.tokens.push((
+            "subagent-attention",
+            active
+                .iter()
+                .filter(|m| matches!(m.status.as_str(), "blocked" | "waiting_network"))
+                .count()
+                .to_string(),
+        ));
+        // ponytail: show three live descendants, add paginated metadata if larger swarms need full detail.
+        for (member, (info_key, task_key)) in active.iter().take(3).zip([
+            ("subagent-1", "subagent-task-1"),
+            ("subagent-2", "subagent-task-2"),
+            ("subagent-3", "subagent-task-3"),
+        ]) {
+            let mut info = vec![
+                metadata_text(
+                    member
+                        .friendly_name
+                        .as_deref()
+                        .unwrap_or(&member.session_id),
+                    24,
+                ),
+                metadata_text(&member.status, 24),
+            ];
+            for value in [&member.runtime.model, &member.runtime.effort] {
+                if let Some(value) = value {
+                    info.push(metadata_text(value, 32));
+                }
+            }
+            if let (Some(used), Some(limit)) =
+                (member.runtime.context_tokens, member.runtime.context_limit)
+            {
+                if limit > 0 {
+                    info.push(format!("ctx {}%", used.saturating_mul(100) / limit));
+                }
+            }
+            if let Some((done, total)) = member.todo_progress {
+                info.push(format!("todos {done}/{total}"));
+            }
+            metadata
+                .tokens
+                .push((info_key, metadata_text(&info.join(" · "), 80)));
+            if let Some(task) = &member.task_label {
+                metadata.tokens.push((task_key, metadata_text(task, 80)));
+            }
         }
         let names = active
             .iter()
@@ -143,13 +273,9 @@ impl App {
             if count > 3 { ", …" } else { "" },
             task.map(|task| format!(" · {task}")).unwrap_or_default(),
         );
-        (
-            state,
-            MetadataReport {
-                summary: Some(metadata_text(&summary, 80)),
-                title_suffix: Some(format!("⏳{count}{}", if attention { "⚠" } else { "" })),
-            },
-        )
+        metadata.summary = Some(metadata_text(&summary, 80));
+        metadata.title_suffix = Some(format!("⏳{count}{}", if attention { "⚠" } else { "" }));
+        (state, metadata)
     }
 
     pub(super) fn set_terminal_title_base(&self, session_id: &str, base: String) {
@@ -265,10 +391,7 @@ mod tests {
     #[test]
     fn herdr_metadata_tracks_only_current_sessions_live_descendants() {
         use crate::protocol::ServerEvent;
-        use crate::tui::herdr::{
-            AgentState::{Idle, Working},
-            MetadataReport,
-        };
+        use crate::tui::herdr::AgentState::{Idle, Working};
         let mut app = super::super::tests::create_test_app();
         app.is_remote = true;
         app.remote_session_id = Some("parent".into());
@@ -277,6 +400,8 @@ mod tests {
             serde_json::from_value(serde_json::json!({
                 "session_id": id, "friendly_name": id, "status": status,
                 "task_label": "Review\n東京\u{1b} task", "report_back_to_session_id": parent,
+                "runtime": {"model": "child-model", "effort": "high", "context_tokens": 50, "context_limit": 100},
+                "todo_progress": [1, 2],
             }))
             .unwrap()
         };
@@ -304,10 +429,41 @@ mod tests {
         assert!(!summary.contains("peer") && !summary.contains("finished"));
         assert!(!summary.chars().any(char::is_control));
         assert!(metadata.title_suffix.unwrap().contains("2"));
+        assert!(
+            metadata
+                .tokens
+                .iter()
+                .any(|(key, value)| *key == "subagent-count" && value == "2")
+        );
+        assert!(
+            metadata
+                .tokens
+                .iter()
+                .any(|(key, value)| *key == "subagent-attention" && value == "1")
+        );
+        let child = &metadata
+            .tokens
+            .iter()
+            .find(|(key, _)| *key == "subagent-1")
+            .unwrap()
+            .1;
+        assert!(
+            child.contains("scout") && child.contains("running") && child.contains("child-model")
+        );
+        assert!(child.contains("high") && child.contains("50%") && child.contains("1/2"));
+        for (_, value) in &metadata.tokens {
+            assert!(!value.chars().any(char::is_control));
+            assert!(unicode_width::UnicodeWidthStr::width(value.as_str()) <= 80);
+        }
         app.remote_session_id = Some("unrelated".into());
-        assert_eq!(
-            app.herdr_state_and_metadata(),
-            (Idle, MetadataReport::default())
+        let (state, metadata) = app.herdr_state_and_metadata();
+        assert_eq!(state, Idle);
+        assert!(metadata.summary.is_none() && metadata.title_suffix.is_none());
+        assert!(
+            !metadata
+                .tokens
+                .iter()
+                .any(|(key, _)| key.starts_with("subagent"))
         );
         app.remote_session_id = Some("parent".into());
         for status in ["ready", "completed", "failed", "crashed", "stopped", "done"] {
@@ -317,10 +473,14 @@ mod tests {
                 },
                 &mut remote,
             );
-            assert_eq!(
-                app.herdr_state_and_metadata(),
-                (Idle, MetadataReport::default()),
-                "{status}"
+            let (state, metadata) = app.herdr_state_and_metadata();
+            assert_eq!(state, Idle, "{status}");
+            assert!(metadata.summary.is_none() && metadata.title_suffix.is_none());
+            assert!(
+                !metadata
+                    .tokens
+                    .iter()
+                    .any(|(key, _)| key.starts_with("subagent"))
             );
         }
     }
@@ -328,10 +488,7 @@ mod tests {
     #[test]
     fn herdr_disconnect_invalidates_children_until_authoritative_status_returns() {
         use crate::protocol::ServerEvent;
-        use crate::tui::herdr::{
-            AgentState::{Idle, Working},
-            MetadataReport,
-        };
+        use crate::tui::herdr::AgentState::{Idle, Working};
         let mut app = super::super::tests::create_test_app();
         app.is_remote = true;
         app.remote_session_id = Some("parent".into());
@@ -361,9 +518,14 @@ mod tests {
             &mut super::super::remote::RemoteRunState::default(),
             None,
         );
-        assert_eq!(
-            app.herdr_state_and_metadata(),
-            (Idle, MetadataReport::default())
+        let (state, metadata) = app.herdr_state_and_metadata();
+        assert_eq!(state, Idle);
+        assert!(metadata.summary.is_none() && metadata.title_suffix.is_none());
+        assert!(
+            !metadata
+                .tokens
+                .iter()
+                .any(|(key, _)| key.starts_with("subagent"))
         );
         assert!(app.remote_swarm_members_received_at.is_none());
         assert!(!app.is_processing());
@@ -381,6 +543,88 @@ mod tests {
             &mut remote,
         );
         assert_eq!(app.herdr_state_and_metadata().0, Working);
+    }
+
+    #[test]
+    fn herdr_parent_metadata_uses_confirmed_facts_and_clears_stale_context() {
+        let mut app = super::super::tests::create_test_app();
+        app.is_remote = true;
+        app.remote_session_id = Some("parent".into());
+        app.suppress_terminal_title_updates = true;
+        app.set_terminal_title_base("parent", "Review 東京".into());
+        app.remote_session_facts_provisional = false;
+        app.remote_provider_model = Some("test-model".into());
+        app.remote_provider_name = Some("test-provider".into());
+        app.remote_reasoning_effort = Some("high".into());
+        app.context_limit = 1000;
+        app.streaming.streaming_input_tokens = 250;
+        app.remote_total_tokens = Some((10, 20));
+        app.token_accounting.total_input_tokens = 30;
+        app.token_accounting.total_output_tokens = 40;
+        app.display_edit_line_counts = (3, 2);
+        app.terminal_title.borrow_mut().last_work = Some(Duration::from_secs(125));
+        let (_, metadata) = app.herdr_state_and_metadata();
+        for (key, expected) in [
+            ("model", "test-model"),
+            ("provider", "test-provider"),
+            ("thinking", "high"),
+            ("ctx", "25%"),
+            ("input-tokens", "40"),
+            ("output-tokens", "60"),
+        ] {
+            assert!(
+                metadata
+                    .tokens
+                    .iter()
+                    .any(|(name, value)| *name == key && value == expected),
+                "{key}: {:?}",
+                metadata.tokens
+            );
+        }
+        assert_eq!(
+            metadata.title.as_deref(),
+            Some("Review 東京 · +3 -2 · last ~2m05s")
+        );
+        assert!(
+            metadata.summary.is_none(),
+            "parent facts must not replace lifecycle labels"
+        );
+        app.streaming.streaming_context_stale = true;
+        let (_, metadata) = app.herdr_state_and_metadata();
+        assert!(!metadata.tokens.iter().any(|(key, _)| *key == "ctx"));
+        app.remote_session_facts_provisional = true;
+        let (_, metadata) = app.herdr_state_and_metadata();
+        assert!(
+            !metadata
+                .tokens
+                .iter()
+                .any(|(key, _)| matches!(*key, "model" | "provider" | "thinking" | "ctx"))
+        );
+        app.remote_session_id = Some("other".into());
+        let (_, metadata) = app.herdr_state_and_metadata();
+        assert!(
+            metadata
+                .title
+                .is_none_or(|title| !title.contains("Review") && !title.contains("last"))
+        );
+    }
+
+    #[test]
+    fn herdr_omits_unknown_restored_token_totals() {
+        let mut app = super::super::tests::create_test_app();
+        app.token_accounting.total_input_tokens = 30;
+        app.token_accounting.total_output_tokens = 40;
+        for remote in [false, true] {
+            app.is_remote = remote;
+            app.remote_total_tokens = None;
+            let (_, metadata) = app.herdr_state_and_metadata();
+            assert!(
+                !metadata
+                    .tokens
+                    .iter()
+                    .any(|(key, _)| matches!(*key, "input-tokens" | "output-tokens"))
+            );
+        }
     }
 
     #[test]
