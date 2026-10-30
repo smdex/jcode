@@ -2551,6 +2551,9 @@ mod turn_envelope_tests {
         .expect("wrapped Done must terminate request waiter")
         .unwrap();
     }
+
+    #[path = "acp_protocol_tests.rs"]
+    mod protocol_tests;
 }
 
 #[cfg(test)]
