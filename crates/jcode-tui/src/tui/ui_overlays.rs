@@ -319,8 +319,12 @@ pub(super) fn draw_help_overlay(frame: &mut Frame, area: Rect, scroll: usize, ap
         "Show the full session context snapshot",
     ));
     lines.push(help_entry(
-        "/skills",
-        "Show loaded skills and jcode-endorsed recommendations",
+        "/skills [reload]",
+        "Show skills or reload installed skills from disk",
+    ));
+    lines.push(help_entry(
+        "/reload-skills",
+        "Reload installed skills from disk",
     ));
     lines.push(help_entry("/info", "Show session info and token usage"));
     lines.push(help_entry(
@@ -627,6 +631,10 @@ pub(super) fn draw_help_overlay(frame: &mut Frame, area: Rect, scroll: usize, ap
     lines.push(key_entry(
         "Ctrl+C / Ctrl+D",
         "Quit (press twice to confirm)",
+    ));
+    lines.push(key_entry(
+        "Ctrl+G",
+        "Edit prompt in $VISUAL/$EDITOR (at chat bottom, no bookmark)",
     ));
     lines.push(key_entry("Ctrl+X", "Cut entire input line to clipboard"));
     lines.push(key_entry(
