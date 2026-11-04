@@ -34,23 +34,25 @@ impl App {
     /// otherwise refreshed only at startup or on a slash-command miss. Calling
     /// this before rendering `/skills` (and on demand elsewhere) keeps newly
     /// added skills visible without a session restart (issue #431).
-    pub(super) fn refresh_skills_snapshot(&mut self) {
+    pub(super) fn refresh_skills_snapshot(&mut self) -> anyhow::Result<()> {
         if crate::tui::is_ssh_remote() {
-            return;
+            return Ok(());
         }
         // Only GLOBAL skills go into the shared registry and the cached
         // snapshot; the project-local overlay is composed per read in
         // `current_skills_snapshot` so it stays session-scoped (issue #457).
-        if let Ok(reloaded) = crate::skill::SkillRegistry::load_global() {
-            self.skills = std::sync::Arc::new(reloaded.clone());
-            if let Ok(mut shared) = self.registry.skills().try_write() {
-                *shared = reloaded;
-            }
-            self.invalidate_command_candidates_cache();
-            // The header lists loaded skills; refresh it now rather than
-            // waiting out the header cache TTL.
-            crate::tui::ui::prepare::invalidate_header_prep_cache();
-        }
+        let reloaded = crate::skill::SkillRegistry::load_global()?;
+        let registry = self.registry.skills();
+        let mut shared = registry
+            .try_write()
+            .map_err(|_| anyhow::anyhow!("Skill registry is busy; try again shortly"))?;
+        *shared = reloaded.clone();
+        self.skills = std::sync::Arc::new(reloaded);
+        self.invalidate_command_candidates_cache();
+        // The header lists loaded skills; refresh it now rather than
+        // waiting out the header cache TTL.
+        crate::tui::ui::prepare::invalidate_header_prep_cache();
+        Ok(())
     }
 
     pub fn cursor_pos(&self) -> usize {
