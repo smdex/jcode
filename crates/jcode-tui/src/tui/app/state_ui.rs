@@ -1851,11 +1851,44 @@ fn build_skills_report(app: &App) -> String {
 }
 
 pub(super) fn handle_info_command(app: &mut App, trimmed: &str) -> bool {
+    if matches!(trimmed, "/skills reload" | "/reload-skills") {
+        if app.is_remote {
+            app.push_display_message(DisplayMessage::error(
+                "Reconnect to the server before reloading skills.".to_string(),
+            ));
+            return true;
+        }
+        match app.refresh_skills_snapshot() {
+            Ok(()) => {
+                let skills = app.available_skills();
+                let count = skills.len();
+                if app
+                    .active_skill
+                    .as_ref()
+                    .is_some_and(|name| !skills.contains(name))
+                {
+                    app.active_skill = None;
+                }
+                app.push_display_message(
+                    DisplayMessage::system(format!("Reloaded {count} skills from disk."))
+                        .with_title("Skills"),
+                );
+                app.set_status_notice(format!("Reloaded {count} skills"));
+            }
+            Err(error) => {
+                app.push_display_message(DisplayMessage::error(format!(
+                    "Failed to reload skills: {error}"
+                )));
+                app.set_status_notice("Skill reload failed");
+            }
+        }
+        return true;
+    }
     if trimmed == "/skills" {
         // Sync from disk first so skills added by agent-side `skill_manage
         // reload_all` (which only updates the server process registry) show up
         // without a restart (issue #431).
-        app.refresh_skills_snapshot();
+        let _ = app.refresh_skills_snapshot();
         app.push_display_message(
             DisplayMessage::system(build_skills_report(app)).with_title("Skills"),
         );
