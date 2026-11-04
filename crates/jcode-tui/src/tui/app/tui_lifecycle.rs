@@ -652,6 +652,7 @@ impl App {
             stashed_input: None,
             input_undo_stack: Vec::new(),
             input_typing_undo: None,
+            pending_prompt_editor: false,
             history_draft: None,
             status_notice: None,
             learn_hint: None,
@@ -1163,6 +1164,7 @@ impl App {
             stashed_input: None,
             input_undo_stack: Vec::new(),
             input_typing_undo: None,
+            pending_prompt_editor: false,
             history_draft: None,
             status_notice: None,
             learn_hint: None,
@@ -1545,7 +1547,7 @@ impl App {
         // Minimal local clients start with empty skill registries. Load global
         // metadata once so autocomplete works before the first History event.
         // SSH clients above must use only the remote server's skill metadata.
-        app.refresh_skills_snapshot();
+        let _ = app.refresh_skills_snapshot();
         mark("skills", &mut laps);
 
         let reload_fast_start = std::env::var("JCODE_RELOAD_FAST_START")
