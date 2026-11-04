@@ -79,6 +79,7 @@ include!("tests/skill_invocation_multi_word.rs");
 include!("tests/remote_header_hint_facts.rs");
 include!("tests/slash_command_boundaries.rs");
 include!("tests/prompt_history_cross_session.rs");
+include!("tests/prompt_editor.rs");
 include!("tests/ssh_remote.rs");
 include!("tests/skill_startup.rs");
 #[test]
@@ -1141,6 +1142,41 @@ fn skills_command_refreshes_registry_from_disk_before_listing() {
     assert!(
         app.current_skills_snapshot().get("late-skill").is_some(),
         "registry snapshot must be synced so /late-skill invocations resolve"
+    );
+}
+
+#[test]
+fn skill_reload_commands_are_local_controls_and_autocomplete() {
+    let mut app = create_test_app();
+    assert!(
+        app.get_suggestions_for("/reload-sk")
+            .iter()
+            .any(|(name, _)| name == "/reload-skills")
+    );
+    for command in ["/skills reload", "/reload-skills"] {
+        assert!(super::commands_dispatch::dispatch_local_command(
+            &mut app, command
+        ));
+        assert!(
+            app.display_messages()
+                .last()
+                .unwrap()
+                .content
+                .contains("Reloaded")
+        );
+        assert!(!app.is_processing);
+    }
+    app.is_remote = true;
+    assert!(super::state_ui::handle_info_command(
+        &mut app,
+        "/skills reload"
+    ));
+    assert!(
+        app.display_messages()
+            .last()
+            .unwrap()
+            .content
+            .contains("Reconnect")
     );
 }
 
