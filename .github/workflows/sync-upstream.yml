@@ -1,0 +1,51 @@
+name: Sync fork with upstream
+
+on:
+  schedule:
+    - cron: "23 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: fork-upstream-rebase
+  cancel-in-progress: false
+
+jobs:
+  rebase:
+    if: github.repository == 'smdex/jcode'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
+      - name: Rebase customizations onto upstream master
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "Sergii Maksymov"
+          git config user.email "s.maximov@proton.me"
+          git fetch origin main
+          git checkout -B main origin/main
+          original=$(git rev-parse HEAD)
+          git remote add upstream https://github.com/1jehuang/jcode.git
+          git fetch upstream master
+          if git merge-base --is-ancestor upstream/master HEAD; then
+            echo "Already contains upstream master" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          backup="sync-backup/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          git push origin "$original:refs/heads/$backup"
+          if ! git rebase --rebase-merges upstream/master; then
+            git rebase --abort
+            echo "Rebase conflicted. Main is unchanged. Backup: $backup" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          git diff --check
+          git merge-base --is-ancestor upstream/master HEAD
+          git push --force-with-lease="refs/heads/main:$original" origin HEAD:refs/heads/main
+          echo "Rebased main onto $(git rev-parse upstream/master). Backup: $backup" >> "$GITHUB_STEP_SUMMARY"
