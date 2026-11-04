@@ -37,6 +37,9 @@ impl App {
             "refresh-model-list" => {
                 "/refresh-model-list\nForce-refresh provider model catalogs, update /model, and persist the refreshed cache."
             }
+            "skills" | "reload-skills" => {
+                "/skills\nShow installed skills and recommendations.\n\n/skills reload  or  /reload-skills\nReload installed skills from disk and refresh autocomplete. In shared-server or SSH mode, reloads the server's registry without restarting Jcode or sending a model prompt."
+            }
             "agents" => {
                 "/agents\nConfigure agent models for this session only, preserved on resume.\n\n/agents <swarm|review|judge|memory|ambient>\nChoose a session override. Use global default clears it, while inherit bypasses a global pin.\n\n/agents default [role] (or /agents global [role])\nEdit saved global defaults for all sessions without a session override. Ambient session choices apply to scheduled workers spawned from this session, not the daemon's independent ambient loop."
             }

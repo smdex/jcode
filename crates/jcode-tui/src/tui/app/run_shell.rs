@@ -305,6 +305,7 @@ fn idle_animation_fast_path_blocked_reason(
 #[derive(Default)]
 pub(super) struct StatusSpinnerRenderer {
     last_frame: Option<Buffer>,
+    last_theme: jcode_tui_style::ThemeMode,
     last_full_frame_at: Option<Instant>,
     /// Animated rectangle whose surrounding cells are currently seeded into
     /// ratatui's working buffer.
@@ -374,6 +375,9 @@ impl StatusSpinnerRenderer {
     }
 
     pub(super) fn idle_animation_only_available(&self, app: &App) -> bool {
+        if self.last_theme != jcode_tui_style::theme_mode() {
+            return false;
+        }
         let blocked = idle_animation_fast_path_blocked_reason(&IdleAnimationFastPathInputs {
             has_previous_frame: self.last_frame.is_some(),
             animation_active: crate::tui::idle_donut_active(app),
@@ -418,6 +422,9 @@ impl StatusSpinnerRenderer {
         app: &App,
         terminal: &mut DefaultTerminal,
     ) -> Result<bool> {
+        if self.last_theme != jcode_tui_style::theme_mode() {
+            return Ok(false);
+        }
         let Some(previous_frame) = self.last_frame.as_ref() else {
             return Ok(false);
         };
@@ -498,6 +505,9 @@ impl StatusSpinnerRenderer {
     ) -> Result<()> {
         // Painting a frame is progress, including during long streaming turns.
         crate::logging::watchdog::beat("tui.draw");
+        if crate::tui::terminal_events::take_theme_redraw() {
+            app.force_full_repaint = true;
+        }
         app.refresh_terminal_title_metrics();
         app.sync_herdr_agent_state();
         app.poll_oauth_account_telemetry();
@@ -565,6 +575,7 @@ impl StatusSpinnerRenderer {
         if crate::tui::ui::last_idle_animation_area().is_some() {
             crate::tui::ui::note_idle_animation_full_repaint();
         }
+        self.last_theme = jcode_tui_style::theme_mode();
         self.last_frame = Some(completed_buffer);
         app.finish_idle_hibernation_frame();
         self.last_full_frame_at = Some(Instant::now());
@@ -592,6 +603,9 @@ impl StatusSpinnerRenderer {
     ) -> Result<bool> {
         let status_symbol = status_spinner_only_symbol(app);
         if status_symbol.is_none() {
+            return Ok(false);
+        }
+        if self.last_theme != jcode_tui_style::theme_mode() {
             return Ok(false);
         }
         let Some(previous_frame) = self.last_frame.as_ref() else {
@@ -690,6 +704,10 @@ impl App {
         }
 
         loop {
+            if self.service_prompt_editor(&mut terminal) {
+                status_spinner_renderer.invalidate();
+                needs_redraw = true;
+            }
             self.sync_sleep_guard();
             let desired_redraw = if self.cloud_job.is_some() {
                 Duration::from_millis(100)
@@ -919,6 +937,10 @@ impl App {
 
             // Main event loop
             loop {
+                if self.service_prompt_editor(&mut terminal) {
+                    status_spinner_renderer.invalidate();
+                    needs_redraw = true;
+                }
                 self.sync_sleep_guard();
                 // The reload fast-start transcript is rendered off-thread. Show
                 // it as soon as it is ready instead of on the next tick: during
