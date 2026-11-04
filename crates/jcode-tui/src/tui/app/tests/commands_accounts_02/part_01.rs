@@ -1204,6 +1204,7 @@ fn test_login_command_opens_inline_login_picker() {
 
 #[test]
 fn test_account_openai_compatible_settings_renders_provider_settings() {
+    let _guard = crate::storage::lock_test_env();
     let mut app = create_test_app();
     app.input = "/account openai-compatible settings".to_string();
     app.submit_input();
