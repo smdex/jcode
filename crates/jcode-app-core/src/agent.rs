@@ -824,8 +824,20 @@ impl Agent {
 
     /// Synchronize the remote client's selected skill, accepting only names
     /// present in the daemon's own registry snapshot.
-    pub(super) fn set_remote_active_skill(&mut self, active_skill: Option<String>) -> bool {
-        let skills = self.current_skills_snapshot();
+    pub(super) async fn set_remote_active_skill(&mut self, active_skill: Option<String>) -> bool {
+        let mut skills = self.current_skills_snapshot();
+        if active_skill
+            .as_ref()
+            .is_some_and(|name| skills.get(name).is_none())
+        {
+            // The client can discover an installation after the daemon started.
+            // Refresh server-owned globals, never trust client-provided content
+            // or put this session's project overlay into the shared registry.
+            match self.reload_skills().await {
+                Ok(_) => skills = self.current_skills_snapshot(),
+                Err(error) => logging::warn(&format!("Failed to refresh skills: {error}")),
+            }
+        }
         let recognized = active_skill
             .as_ref()
             .is_none_or(|name| skills.get(name).is_some());
@@ -860,6 +872,13 @@ impl Agent {
             Some(StoredDisplayRole::System),
         );
         self.persist_session_best_effort("active skill announcement");
+    }
+
+    pub(super) async fn reload_skills(&mut self) -> Result<Vec<String>> {
+        let global = SkillRegistry::load_global()?;
+        self.skills = Arc::new(global.clone());
+        *self.registry.skills().write().await = global;
+        Ok(self.available_skill_names())
     }
 
     fn sync_session_compaction_state_from_manager(

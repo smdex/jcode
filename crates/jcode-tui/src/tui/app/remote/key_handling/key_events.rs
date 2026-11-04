@@ -533,6 +533,10 @@ pub(super) async fn handle_remote_key_internal(
         return Ok(());
     }
 
+    if app.request_prompt_editor_for_key(code, modifiers) {
+        return Ok(());
+    }
+
     if app.scroll_keys.is_bookmark(code, modifiers) {
         app.toggle_scroll_bookmark();
         return Ok(());
