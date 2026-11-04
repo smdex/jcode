@@ -709,6 +709,10 @@ impl App {
         }
 
         loop {
+            if self.service_prompt_editor(&mut terminal) {
+                status_spinner_renderer.invalidate();
+                needs_redraw = true;
+            }
             self.sync_sleep_guard();
             let desired_redraw = if self.cloud_job.is_some() {
                 Duration::from_millis(100)
@@ -940,6 +944,10 @@ impl App {
             let mut deferred_redraw_at: Option<tokio::time::Instant> = None;
             // Main event loop
             loop {
+                if self.service_prompt_editor(&mut terminal) {
+                    status_spinner_renderer.invalidate();
+                    needs_redraw = true;
+                }
                 self.sync_sleep_guard();
                 // The reload fast-start transcript is rendered off-thread. Show
                 // it as soon as it is ready instead of on the next tick: during
