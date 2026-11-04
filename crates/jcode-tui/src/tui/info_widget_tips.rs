@@ -13,7 +13,7 @@ fn all_tips() -> Vec<Tip> {
     let mut tips = vec![
         "Ctrl+J / Ctrl+K to jump between user prompts (Cmd+J / Cmd+K on macOS terminals that forward Command)",
         "Ctrl+Shift+J / Ctrl+Shift+K to scroll the chat down and up one line",
-        "Ctrl+G to bookmark your scroll position - press again to teleport back",
+        "Ctrl+G edits your prompt in $EDITOR at chat bottom, or bookmarks scrollback",
         "Swarms form automatically when multiple sessions share a repo - they coordinate plans, share context, and track file conflicts",
         "Memories are stored in a graph with semantic embeddings - recall finds related facts even if you use different words",
         "Ambient mode runs background cycles while you're away - maintaining memories, compacting context, and doing proactive work",
