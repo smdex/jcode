@@ -757,6 +757,10 @@ impl App {
         }
 
         loop {
+            if self.service_prompt_editor(&mut terminal) {
+                status_spinner_renderer.invalidate();
+                needs_redraw = true;
+            }
             self.sync_sleep_guard();
             let desired_redraw = if self.cloud_job.is_some() {
                 Duration::from_millis(100)
@@ -1002,6 +1006,10 @@ impl App {
             let mut server_events_held_until: Option<tokio::time::Instant> = None;
             // Main event loop
             loop {
+                if self.service_prompt_editor(&mut terminal) {
+                    status_spinner_renderer.invalidate();
+                    needs_redraw = true;
+                }
                 self.sync_sleep_guard();
                 // Sends only when focus or visibility changed since the last report.
                 let focused = self.client_focused();
