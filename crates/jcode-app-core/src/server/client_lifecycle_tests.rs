@@ -1474,7 +1474,7 @@ async fn message_with_late_installed_skill_reaches_completion() {
         processing,
         "late installation must be accepted instead of emitting the not-installed error"
     );
-    let (id, result, _) = tokio::time::timeout(Duration::from_secs(5), done_rx.recv())
+    let (id, result, _, _, _) = tokio::time::timeout(Duration::from_secs(5), done_rx.recv())
         .await
         .expect("turn must finish")
         .expect("completion event");
@@ -1483,6 +1483,7 @@ async fn message_with_late_installed_skill_reaches_completion() {
     task.unwrap().await.unwrap();
     let mut saw_done = false;
     while let Ok(event) = event_rx.try_recv() {
+        let event = turn_payload(event);
         assert!(
             !matches!(event, ServerEvent::Error { .. }),
             "unexpected error: {event:?}"

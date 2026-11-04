@@ -227,7 +227,17 @@ fn advertised_commands_cover_all_acp_daemon_model_controls() {
         .iter()
         .map(|command| command["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, ["model", "models", "effort", "subagent", "subagent-model", "skills"]);
+    assert_eq!(
+        names,
+        [
+            "model",
+            "models",
+            "effort",
+            "subagent",
+            "subagent-model",
+            "skills"
+        ]
+    );
     assert_eq!(commands[0]["input"]["hint"], "model id (optional)");
     assert!(commands[1].get("input").is_none());
     assert!(
@@ -398,7 +408,10 @@ fn config_options_include_model_selector_and_effort_ladder() {
     assert_eq!(model["currentValue"], "gpt-5.2");
     assert_eq!(model["options"].as_array().unwrap().len(), 2);
 
-    let effort = options.iter().find(|option| option["id"] == CONFIG_ID_EFFORT).unwrap();
+    let effort = options
+        .iter()
+        .find(|option| option["id"] == CONFIG_ID_EFFORT)
+        .unwrap();
     assert_eq!(effort["id"], CONFIG_ID_EFFORT);
     assert_eq!(effort["category"], "thought_level");
     assert_eq!(effort["currentValue"], "high");
