@@ -23,11 +23,11 @@ use crate::session::{Session, StoredMessage};
 use crate::skill::SkillRegistry;
 use crate::tool::selfdev::ReloadContext;
 use crate::tool::{Registry, ToolContext};
+use crate::tui::terminal_events::EventStream;
 use anyhow::Result;
 use auth::PendingLogin;
 use crossterm::event::{
-    Event, EventStream, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
-    MouseEventKind,
+    Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use debug::DebugTrace;
 use futures::StreamExt;
@@ -99,6 +99,7 @@ pub(crate) mod onboarding_graph;
 mod onboarding_repair;
 mod onboarding_sim;
 mod productivity;
+mod prompt_editor;
 mod prompt_history;
 mod remote;
 mod remote_header_hint;
@@ -1667,6 +1668,8 @@ pub struct App {
     // Undo history for in-progress input editing (Ctrl+Z)
     input_undo_stack: Vec<(String, usize)>,
     input_typing_undo: Option<(Instant, usize)>,
+    // Serviced by the loop owner, never inside a key handler or burst drain.
+    pending_prompt_editor: bool,
     // Draft replaced by an explicit jump into prompt history (Ctrl+Up),
     // restored when Down walks back past the newest entry
     history_draft: Option<(String, usize)>,
