@@ -8,6 +8,41 @@ This covers visible swarm spawns, resume-in-new-terminal, self-development launc
 
 Inside a Herdr pane, the TUI also reports `idle`/`working`, the session id, and its `jcode --resume` command through `"$HERDR_BIN_PATH" pane report-agent`, and releases the pane on quit (`crates/jcode-tui/src/tui/herdr.rs`). Herdr older than 0.9.2 rejects the `--` resume separator as a usage error (exit 2) and drops the whole report. On that specific error Jcode retries once without the resume command and keeps reporting state only for the rest of the process.
 
+## Display metadata on the existing pane
+
+The TUI also sends display-only `pane report-metadata` snapshots under the stable
+`jcode:subagents` source, scoped to the `jcode` lifecycle source. This does not
+spawn panes, attach clients, or change swarm/TUI controls.
+
+- The title follows the current session title, successful edit-output line counts
+  (not repository diff stats), and current/last observed work duration.
+- Tokens: `model`, `provider`, `thinking`, `ctx` (observed context used
+  percentage), `input-tokens`, and `output-tokens`. Session identity remains in
+  the lifecycle report; edits and duration remain in the title to stay within
+  Herdr's 16-token-update limit (including clears). Token totals are published
+  only for remote sessions with an authoritative history baseline, and include
+  that history plus current-client usage; they are not per-turn counters. Local
+  restores lack that baseline, so their totals are omitted. Unknown/provisional model facts and
+  stale post-compaction context are omitted, not guessed.
+- Live descendants of the current session supply `subagent-count`,
+  `subagent-attention`, and up to three `subagent-N` / `subagent-task-N` pairs.
+  Details include name, status, and available model, effort, context percentage,
+  and todo progress. Each value is sanitized and capped at 80 characters/display
+  cells; summaries may truncate. Finished/unrelated children are excluded.
+- Existing `summary`, state labels, and `title-suffix` retain the compact child
+  count/names/task/attention display. Child attention does not change the parent
+  lifecycle to `blocked`.
+
+Metadata-only updates coalesce to at most one per second; lifecycle changes are
+not delayed. Snapshots refresh every 45 seconds with a 120-second TTL. Missing
+fields are explicitly cleared on the next snapshot, and all owned fields are
+cleared on quit. Older Herdr CLIs that reject metadata continue receiving
+lifecycle reports. Token availability does not imply every token is shown by the
+current Herdr sidebar layout.
+
+No account identities, costs, transcript/output snippets, or full paths are
+exported. Task labels and session titles **are** display metadata, as in the TUI.
+
 ## Current compatibility
 
 Jcode already:

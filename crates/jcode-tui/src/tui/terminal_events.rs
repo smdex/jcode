@@ -429,10 +429,41 @@ pub(super) fn try_read() -> io::Result<Option<Event>> {
     Ok(None)
 }
 
-/// Crossterm's event stream, with nonblocking periodic OSC 11 queries and report
-/// filtering. The timer is polled even during LLM output and tool execution.
+/// Finish an already-issued color query before giving the terminal to an
+/// editor. Only the loop owner reads input, so there is no worker to race with.
+pub(super) fn prepare_editor_handoff() {
+    let mut state = runtime().lock().unwrap_or_else(|error| error.into_inner());
+    while let Some(until) = state.reports.expecting_until {
+        let now = Instant::now();
+        if now >= until {
+            break;
+        }
+        let wait = (until - now).min(Duration::from_millis(20));
+        match crossterm::event::poll(wait) {
+            Ok(true) => match crossterm::event::read() {
+                Ok(event) => state.reports.push(event, Instant::now()),
+                Err(_) => break,
+            },
+            Ok(false) => {}
+            Err(_) => break,
+        }
+    }
+    state.reports.reset(false);
+    state.reports.expecting_until = None;
+    state.cache_query_at = None;
+    state.last_query = Some(Instant::now());
+}
+
+/// Single-owner crossterm input with readiness wakeups and OSC 11 filtering.
+///
+/// Crossterm's async EventStream starts a thread that reads the terminal even
+/// while the UI is suspended. Its Drop does not join that thread, which can
+/// steal keys from an external editor. Watch readiness without reading instead:
+/// all reads now happen synchronously in the UI task. Unix uses the reactor,
+/// with a short polling fallback on Windows or non-pollable input descriptors.
 pub(super) struct EventStream {
-    inner: crossterm::event::EventStream,
+    #[cfg(unix)]
+    input_ready: Option<tokio::io::unix::AsyncFd<std::fs::File>>,
     tick: Pin<Box<tokio::time::Sleep>>,
     /// Deadline `tick` is currently armed for.
     armed: Instant,
@@ -441,7 +472,18 @@ pub(super) struct EventStream {
 impl EventStream {
     pub(super) fn new() -> Self {
         Self {
-            inner: crossterm::event::EventStream::new(),
+            #[cfg(unix)]
+            input_ready: {
+                use std::os::unix::fs::OpenOptionsExt;
+                // Match crossterm's controlling-tty source. No data is ever
+                // read through this extra descriptor, including during editors.
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NONBLOCK)
+                    .open("/dev/tty")
+                    .and_then(tokio::io::unix::AsyncFd::new)
+                    .ok()
+            },
             tick: Box::pin(tokio::time::sleep(Duration::ZERO)),
             armed: Instant::now(),
         }
@@ -456,6 +498,7 @@ impl EventStream {
         if !fired && want >= self.armed {
             return;
         }
+
         self.armed = want;
         self.tick
             .as_mut()
@@ -475,8 +518,12 @@ impl EventStream {
         }
         // Bound the work per poll while draining the key-shaped color report.
         for _ in 0..64 {
-            match Pin::new(&mut self.inner).poll_next(cx) {
-                Poll::Ready(Some(Ok(event))) => {
+            match crossterm::event::poll(Duration::ZERO) {
+                Ok(true) => {
+                    let event = match crossterm::event::read() {
+                        Ok(event) => event,
+                        Err(error) => return Poll::Ready(Some(Err(error))),
+                    };
                     let now = Instant::now();
                     state.note_focus(&event);
                     if event == Event::FocusGained {
@@ -487,7 +534,26 @@ impl EventStream {
                         return Poll::Ready(Some(Ok(event)));
                     }
                 }
-                other => return other,
+                Ok(false) => {
+                    #[cfg(unix)]
+                    if let Some(input) = self.input_ready.as_ref() {
+                        match input.poll_read_ready(cx) {
+                            Poll::Ready(Ok(mut ready)) => {
+                                ready.clear_ready();
+                                cx.waker().wake_by_ref();
+                            }
+                            Poll::Ready(Err(_)) => {
+                                self.input_ready = None;
+                                self.armed = Instant::now();
+                                self.tick.as_mut().reset(tokio::time::Instant::now());
+                                cx.waker().wake_by_ref();
+                            }
+                            Poll::Pending => {}
+                        }
+                    }
+                    return Poll::Pending;
+                }
+                Err(error) => return Poll::Ready(Some(Err(error))),
             }
         }
         cx.waker().wake_by_ref();
