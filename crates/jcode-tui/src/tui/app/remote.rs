@@ -549,6 +549,9 @@ pub(super) async fn handle_terminal_event(
     // lag. Mirrors the identical drain in `local::handle_terminal_event`.
     const MAX_DRAINED_EVENTS_PER_WAKE: usize = 32;
     for _ in 0..MAX_DRAINED_EVENTS_PER_WAKE {
+        if app.pending_prompt_editor {
+            break;
+        }
         if let Ok(Some(event)) = crate::tui::terminal_events::try_read() {
             needs_redraw |= apply_terminal_event(app, terminal, remote, Some(Ok(event))).await?;
         } else {
@@ -1205,6 +1208,13 @@ pub(super) fn handle_disconnect(
     });
     state.disconnect_msg_idx = Some(app.display_messages.len() - 1);
     state.reconnect_attempts = 1;
+    // Cached activity is no longer authoritative. Keep queued content, but
+    // clear transient busy flags so a redraw cannot resurrect Working.
+    app.pending_split_started_at = None;
+    app.pending_queued_dispatch = false;
+    app.remote_swarm_members.clear();
+    app.remote_swarm_members_received_at = None;
+    app.sync_herdr_agent_state();
 }
 
 /// First wait before the watchdog re-requests history. Generous enough that a
